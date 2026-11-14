@@ -1,0 +1,16 @@
+# Model outputs, adapters and logs stay local
+outputs/
+*.safetensors
+
+# Downloaded datasets (GSM8K, GSM8K-SC) are fetched at run time
+data/cache/
+
+# Environments and editor files
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.DS_Store
+.idea/
+.vscode/
