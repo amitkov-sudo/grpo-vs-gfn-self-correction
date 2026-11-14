@@ -16,6 +16,8 @@ python -m pytest -q tests          # offline checks on the CPU
 python train/train.py --smoke      # code check on the CPU with a tiny random model
 ```
 
+If PEFT stops with "Found an incompatible version of torchao", run `pip uninstall -y torchao`. Kaggle ships torchao 0.10, which recent PEFT rejects, and this repository does not use torchao.
+
 On a GPU (Kaggle, Colab, Modal, or the program's A100), the sanity check is three runs with the same prompts and budget:
 
 ```bash
