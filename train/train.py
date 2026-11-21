@@ -40,6 +40,7 @@ from selfcorrect import data, losses, scoring  # noqa: E402
 
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 SMOKE_TOKENIZER = "Qwen/Qwen3-0.6B"
+OOM = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)   # another team may share the GPU
 
 
 # ------------------------------------------------------------------------------------------ settings
@@ -65,6 +66,8 @@ def parse_args(argv=None):
     p.add_argument("--eval-every", type=int, default=20, help="0 evaluates only before and after training")
     p.add_argument("--eval-n", type=int, default=200, help="gsm8k: test problems; fix: test problems, at most 60")
     p.add_argument("--eval-max-new-tokens", type=int, default=400)
+    p.add_argument("--eval-samples", type=int, default=0,
+                   help="also sample this many answers per evaluation start at --temperature (pass@k, sampled rates)")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--grad-checkpointing", action="store_true", help="less memory, slower; use for 8B")
     p.add_argument("--seed", type=int, default=0)
@@ -213,15 +216,28 @@ def left_pad(seqs, pad_id, device):
 
 @torch.no_grad()
 def generate(model, tok, prompts, max_new, a, eos_ids, device, greedy=False):
-    """Continuations as token lists, each cut after its first end token."""
+    """Continuations as token lists, each cut after its first end token.
+
+    When the GPU runs out of memory, the batch halves for the rest of the run and the same prompts are tried again.
+    """
     model.eval()
     sampling = {"do_sample": False} if greedy else {"do_sample": True, "temperature": a.temperature,
                                                     "top_p": 1.0, "top_k": 0}
-    outs = []
-    for b in range(0, len(prompts), a.gen_batch):
-        ids, att = left_pad(prompts[b:b + a.gen_batch], tok.pad_token_id, device)
-        gen = model.generate(input_ids=ids, attention_mask=att, max_new_tokens=max_new,
-                             pad_token_id=tok.pad_token_id, eos_token_id=eos_ids, **sampling)
+    outs, b = [], 0
+    while b < len(prompts):
+        chunk = prompts[b:b + a.gen_batch]
+        try:
+            ids, att = left_pad(chunk, tok.pad_token_id, device)
+            gen = model.generate(input_ids=ids, attention_mask=att, max_new_tokens=max_new,
+                                 pad_token_id=tok.pad_token_id, eos_token_id=eos_ids, **sampling)
+        except OOM:
+            if a.gen_batch == 1:
+                raise
+            a.gen_batch //= 2
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(f"out of GPU memory: generating {a.gen_batch} sequences at a time from now on", flush=True)
+            continue
         for row in gen[:, ids.shape[1]:].tolist():
             toks = []
             for t in row:
@@ -229,6 +245,7 @@ def generate(model, tok, prompts, max_new, a, eos_ids, device, greedy=False):
                 if t in eos_ids:
                     break
             outs.append(toks)
+        b += len(chunk)
     return outs
 
 
@@ -307,6 +324,25 @@ def train_step(model, opt, params, jobs, a, device, pad_id):
     return {"loss": loss_value, "grad_norm": gnorm, "log_ratio": float((cur - ref).mean())}
 
 
+def train_step_fitting_memory(model, opt, params, jobs, a, device, pad_id):
+    """train_step, with micro-batches halved for the rest of the run each time the GPU runs out of memory.
+
+    The error comes before the optimizer step, so the step runs again from the start. The micro-batch size does not
+    change the gradient (tests/test_train.py).
+    """
+    while True:
+        try:
+            return train_step(model, opt, params, jobs, a, device, pad_id)
+        except OOM:
+            if a.micro_batch == 1:
+                raise
+            a.micro_batch //= 2
+            opt.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(f"out of GPU memory: micro-batches of {a.micro_batch} from now on", flush=True)
+
+
 def step_stats(jobs):
     s = {}
     for kind in sorted({j["item"]["kind"] for j in jobs}):
@@ -322,7 +358,46 @@ def step_stats(jobs):
     return s
 
 
+def sampled_summary(rows, k):
+    """Rates over k sampled answers per start. pass@k is the share of starts with at least one right answer."""
+    out = {}
+    for kind in sorted({r["kind"] for r in rows}):
+        rs = [r for r in rows if r["kind"] == kind]
+        per_start = {}
+        for r in rs:
+            per_start.setdefault(r["id"], []).append(r["correct"])
+        right = sum(r["correct"] for r in rs) / len(rs)
+        pass_k = sum(any(v) for v in per_start.values()) / len(per_start)
+        if kind == "wrong":
+            out.update({"fix_rate_sampled": right, f"fix_pass_at_{k}": pass_k})
+        elif kind == "clean":
+            out.update({"clean_right_sampled": right,
+                        "false_alarm_rate_sampled": sum(r["doubt"] for r in rs) / len(rs)})
+        else:
+            out.update({"accuracy_sampled": right, f"pass_at_{k}": pass_k})
+    return out
+
+
+def sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts):
+    """k sampled answers per start. Uses its own random stream, so training samples stay the same with or without it."""
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(1_000_003 * (a.seed + 1) + step)
+        reps = [(it, p) for it, p in zip(items, prompts) for _ in range(a.eval_samples)]
+        gens = generate(model, tok, [p for _, p in reps], a.eval_max_new_tokens, a, eos_ids, device)
+    rows = []
+    for (it, _), g in zip(reps, gens):
+        text = tok.decode(g, skip_special_tokens=True)
+        rows.append({"id": it["id"], "kind": it["kind"], "correct": scoring.is_correct(text, it["gold"]),
+                     "doubt": scoring.opens_with_doubt(text), "text": text})
+    with open(os.path.join(out_dir, f"eval_step{step}_samples.jsonl"), "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return sampled_summary(rows, a.eval_samples)
+
+
 def evaluate(model, tok, a, eos_ids, device, step, out_dir):
+    t0 = time.time()
     items = eval_items(a)
     prompts = [encode(tok, prompt_text(tok, it["question"], it["start"])) for it in items]
     gens = generate(model, tok, prompts, a.eval_max_new_tokens, a, eos_ids, device, greedy=True)
@@ -346,6 +421,9 @@ def evaluate(model, tok, a, eos_ids, device, step, out_dir):
         summary[name + "_ci95"] = [round(lo, 3), round(hi, 3)]
         if kind != "blank":
             summary[("false_alarms" if kind == "clean" else "doubt_on_wrong")] = sum(r["doubt"] for r in rs)
+    if a.eval_samples:
+        summary.update(sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts))
+    summary["t_eval"] = round(time.time() - t0, 1)
     return summary
 
 
@@ -386,8 +464,8 @@ def main(argv=None):
         t0 = time.time()
         jobs = sample_batch(model, tok, starts.next(a.prompts), a, eos_ids, device)
         t_gen = time.time() - t0
-        rec = {"step": step, **train_step(model, opt, params, jobs, a, device, tok.pad_token_id), **step_stats(jobs),
-               "t_gen": round(t_gen, 1), "t_step": round(time.time() - t0, 1)}
+        stats = train_step_fitting_memory(model, opt, params, jobs, a, device, tok.pad_token_id)
+        rec = {"step": step, **stats, **step_stats(jobs), "t_gen": round(t_gen, 1), "t_step": round(time.time() - t0, 1)}
         record(rec)
         if (a.eval_every and step % a.eval_every == 0) or step == a.steps:
             record({"eval": evaluate(model, tok, a, eos_ids, device, step, out_dir)})

@@ -1,0 +1,140 @@
+"""Tables of the runs in outputs/: final and per-step evaluations, progress, and time left for a queue.
+
+  python scripts/summarize_runs.py                                   # every run in outputs/
+  python scripts/summarize_runs.py --prefix phase1- \
+      --expect phase1-T5-s0 phase1-T4-s0 --steps 60 --eval-every 20  # adds the time left for those runs
+
+Reads outputs/<run>/config.json and log.jsonl, which train/train.py writes. Prints Markdown.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+
+
+def load_run(d):
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    steps, evals = [], []
+    log = os.path.join(d, "log.jsonl")
+    if os.path.exists(log):
+        for line in open(log):
+            if line.strip():
+                rec = json.loads(line)
+                if "eval" in rec:
+                    evals.append(rec["eval"])
+                else:
+                    steps.append(rec)
+    return {"name": os.path.basename(d.rstrip("/")), "cfg": cfg, "steps": steps, "evals": evals,
+            "done": os.path.isdir(os.path.join(d, "adapter"))}
+
+
+def find_runs(out_dir, prefix):
+    dirs = sorted(d for d in glob.glob(os.path.join(out_dir, prefix + "*")) if os.path.exists(os.path.join(d, "config.json")))
+    return [load_run(d) for d in dirs]
+
+
+def pct(x):
+    return "" if x is None else f"{100 * x:.1f}%"
+
+
+def eval_cells(e):
+    """Columns for one evaluation: greedy counts, then sampled rates when the run sampled."""
+    k = next((key.rsplit("_", 1)[1] for key in e if key.startswith("fix_pass_at_")), None)
+    if "fix_rate" in e:
+        clean_n = e.get("clean_right_count", "0/0").split("/")[1]
+        cells = [e.get("fix_rate_count", ""), f"{e.get('false_alarms', '')}/{clean_n}", e.get("clean_right_count", "")]
+        cells += [pct(e.get(f"fix_pass_at_{k}")) if k else "", pct(e.get("fix_rate_sampled")),
+                  pct(e.get("false_alarm_rate_sampled"))]
+    else:
+        cells = [e.get("accuracy_count", ""), "", "", "", pct(e.get("accuracy_sampled")), ""]
+    return cells, k
+
+
+HEAD = "| run | condition | step | fix rate | false alarms | clean right | fix pass@{k} | sampled fix rate | sampled false alarms |"
+
+
+def eval_table(runs, final_only):
+    rows, k_seen = [], None
+    for r in runs:
+        evals = r["evals"][-1:] if final_only else r["evals"]
+        for e in evals:
+            cells, k = eval_cells(e)
+            k_seen = k_seen or k
+            rows.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {e['step']} | " + " | ".join(map(str, cells)) + " |")
+    if not rows:
+        return ["No evaluations yet."]
+    head = HEAD.format(k=k_seen or "k")
+    return [head, "|" + "---|" * (head.count("|") - 1)] + rows
+
+
+def mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def progress_table(runs):
+    out = ["| run | condition | steps done | last log-ratio | mean step time | finished |", "|---|---|---|---|---|---|"]
+    for r in runs:
+        st = r["steps"]
+        ratio = f"{st[-1]['log_ratio']:.2f}" if st else ""
+        t = f"{mean([s['t_step'] for s in st]):.0f} s" if st else ""
+        out.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {len(st)}/{r['cfg'].get('steps', '?')} | "
+                   f"{ratio} | {t} | {'yes' if r['done'] else 'no'} |")
+    return out
+
+
+def match(runs, name):
+    """The latest run directory for a queue name; train.py adds -YYYYmmdd-HHMMSS when the name is taken."""
+    pat = re.compile(re.escape(name) + r"(-\d{8}-\d{6})?$")
+    hits = [r for r in runs if pat.match(r["name"])]
+    done = [r for r in hits if r["done"]]
+    return (done or hits or [None])[-1]
+
+
+def time_left(runs, expect, steps, eval_every):
+    """Seconds left for the expected runs, from the mean step and evaluation times so far, or None."""
+    t_step = mean([s["t_step"] for r in runs for s in r["steps"]])
+    t_eval = mean([e["t_eval"] for r in runs for e in r["evals"] if "t_eval" in e])
+    if t_step is None:
+        return None
+    n_evals = 1 + steps // eval_every + (1 if steps % eval_every else 0) if eval_every else 2
+    total = 0.0
+    for name in expect:
+        r = match(runs, name)
+        if r is not None and r["done"]:
+            continue
+        done_steps = len(r["steps"]) if r else 0
+        done_evals = len(r["evals"]) if r else 0
+        total += (steps - done_steps) * t_step + max(n_evals - done_evals, 0) * (t_eval or 0.0)
+    return total
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs"))
+    p.add_argument("--prefix", default="")
+    p.add_argument("--expect", nargs="*", default=[], help="queue run names, in order, for the time left")
+    p.add_argument("--steps", type=int, default=60)
+    p.add_argument("--eval-every", type=int, default=20)
+    a = p.parse_args(argv)
+    runs = find_runs(a.out, a.prefix)
+    lines = ["## Final evaluations", ""] + eval_table(runs, final_only=True)
+    lines += ["", "Fix rate and clean right use greedy decoding on the 60 GSM8K-SC test problems. A false alarm is a",
+              "correct start whose continuation opens by calling the step wrong. The sampled columns use the",
+              "sampled answers per start at temperature 1.", ""]
+    lines += ["## Every evaluation", ""] + eval_table(runs, final_only=False)
+    lines += ["", "## Progress", ""] + progress_table(runs)
+    if a.expect:
+        left = time_left(runs, a.expect, a.steps, a.eval_every)
+        done = sum(1 for n in a.expect if (match(runs, n) or {}).get("done"))
+        lines += ["", f"Queue: {done} of {len(a.expect)} runs finished."]
+        if left is None:
+            lines.append("Time left: unknown until the first training steps finish.")
+        else:
+            lines.append(f"Time left for the queue: about {int(left // 3600)} h {int(left % 3600 // 60)} min "
+                         f"(estimate from the mean step and evaluation times so far).")
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()

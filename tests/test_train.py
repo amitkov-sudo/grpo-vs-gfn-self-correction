@@ -85,3 +85,60 @@ def test_tb_on_own_attempts_makes_the_t3_update(model):
     _, g_tb = trainer_gradient(model, "tb", micro_batch=2)
     _, g_t3 = trainer_gradient(model, "grpo", anchor=True, micro_batch=2)
     assert torch.allclose(g_tb, g_t3, atol=1e-8, rtol=1e-6)
+
+
+def test_sampled_summary_counts_pass_at_k_per_start():
+    rows = [{"id": 1, "kind": "wrong", "correct": True, "doubt": False},
+            {"id": 1, "kind": "wrong", "correct": False, "doubt": True},
+            {"id": 2, "kind": "wrong", "correct": False, "doubt": False},
+            {"id": 2, "kind": "wrong", "correct": False, "doubt": False},
+            {"id": 1, "kind": "clean", "correct": True, "doubt": True},
+            {"id": 1, "kind": "clean", "correct": True, "doubt": False},
+            {"id": 2, "kind": "clean", "correct": False, "doubt": False},
+            {"id": 2, "kind": "clean", "correct": True, "doubt": False}]
+    s = T.sampled_summary(rows, 2)
+    assert s == {"fix_rate_sampled": 0.25, "fix_pass_at_2": 0.5,
+                 "clean_right_sampled": 0.75, "false_alarm_rate_sampled": 0.25}
+
+
+class _FullGPU:
+    """Fails like a full GPU whenever asked for more than two sequences at once."""
+
+    def __init__(self):
+        self.calls = []
+
+    def eval(self):
+        return self
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, pad_token_id, eos_token_id, **kw):
+        self.calls.append(input_ids.shape[0])
+        if input_ids.shape[0] > 2:
+            raise T.OOM("CUDA out of memory")
+        new = torch.tensor([[7, 9, 7]] * input_ids.shape[0])
+        return torch.cat([input_ids, new], dim=1)
+
+
+def test_generate_halves_the_batch_when_memory_runs_out():
+    a = SimpleNamespace(gen_batch=8, temperature=1.0)
+    model = _FullGPU()
+    outs = T.generate(model, SimpleNamespace(pad_token_id=0), [[1, 2], [3], [4, 5, 6], [7], [8]], 3, a, [9], CPU,
+                      greedy=True)
+    assert outs == [[7, 9]] * 5                          # every prompt answered once, cut after the end token
+    assert model.calls == [5, 4, 2, 2, 1]
+    assert a.gen_batch == 2
+
+
+def test_train_step_reruns_with_smaller_micro_batches_when_memory_runs_out(monkeypatch):
+    a = SimpleNamespace(micro_batch=8)
+    tried = []
+
+    def fake_step(model, opt, params, jobs, a, device, pad_id):
+        tried.append(a.micro_batch)
+        if a.micro_batch > 2:
+            raise T.OOM("CUDA out of memory")
+        return {"loss": 0.0}
+
+    monkeypatch.setattr(T, "train_step", fake_step)
+    opt = SimpleNamespace(zero_grad=lambda set_to_none=True: None)
+    assert T.train_step_fitting_memory(None, opt, [], [], a, CPU, 0) == {"loss": 0.0}
+    assert tried == [8, 4, 2]

@@ -1,0 +1,56 @@
+"""Checks of scripts/summarize_runs.py on made-up run folders."""
+import importlib.util
+import json
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("summarize_runs", os.path.join(ROOT, "scripts", "summarize_runs.py"))
+S = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(S)
+
+
+def make_run(out, name, condition, n_steps, evals, done, t_step=100.0):
+    d = os.path.join(out, name)
+    os.makedirs(d)
+    json.dump({"condition": condition, "steps": 60}, open(os.path.join(d, "config.json"), "w"))
+    with open(os.path.join(d, "log.jsonl"), "w") as f:
+        for e in evals:
+            if e["step"] == 0:
+                f.write(json.dumps({"eval": e}) + "\n")
+        for s in range(1, n_steps + 1):
+            f.write(json.dumps({"step": s, "log_ratio": 0.5 * s, "t_step": t_step}) + "\n")
+            for e in evals:
+                if e["step"] == s:
+                    f.write(json.dumps({"eval": e}) + "\n")
+    if done:
+        os.makedirs(os.path.join(d, "adapter"))
+
+
+def fix_eval(step, fixed, alarms, t_eval=50.0):
+    return {"step": step, "fix_rate": fixed / 60, "fix_rate_count": f"{fixed}/60", "clean_right_count": "55/60",
+            "false_alarms": alarms, "fix_pass_at_8": 0.5, "fix_rate_sampled": 0.25,
+            "false_alarm_rate_sampled": 0.1, "t_eval": t_eval}
+
+
+def test_tables_and_time_left(tmp_path, capsys):
+    out = str(tmp_path)
+    evals = [fix_eval(s, 4 + s // 20, 1) for s in (0, 20, 40, 60)]
+    make_run(out, "phase1-T5-s0", "T5", 60, evals, done=True)
+    make_run(out, "phase1-T4-s0", "T4", 30, evals[:2], done=False)
+    S.main(["--out", out, "--prefix", "phase1-", "--steps", "60", "--eval-every", "20",
+            "--expect", "phase1-T5-s0", "phase1-T4-s0", "phase1-T3-s0"])
+    text = capsys.readouterr().out
+    assert "| phase1-T5-s0 | T5 | 60 | 7/60 | 1/60 | 55/60 | 50.0% | 25.0% | 10.0% |" in text
+    assert "| phase1-T4-s0 | T4 | 30/60 | 15.00 | 100 s | no |" in text
+    assert "Queue: 1 of 3 runs finished." in text
+    # T4 has 30 steps and 2 evaluations left, T3 all 60 steps and 4 evaluations: 90 * 100 s + 6 * 50 s = 9,300 s
+    assert "about 2 h 35 min" in text
+
+
+def test_a_rerun_with_a_timestamp_counts_as_the_queue_entry(tmp_path):
+    out = str(tmp_path)
+    make_run(out, "phase1-T5-s0", "T5", 10, [fix_eval(0, 4, 1)], done=False)
+    make_run(out, "phase1-T5-s0-20261118-101500", "T5", 60, [fix_eval(0, 4, 1)], done=True)
+    runs = S.find_runs(out, "phase1-")
+    assert S.match(runs, "phase1-T5-s0")["done"]
+    assert S.time_left(runs, ["phase1-T5-s0"], 60, 20) == 0.0

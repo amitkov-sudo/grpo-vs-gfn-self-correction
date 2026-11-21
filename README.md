@@ -5,6 +5,10 @@ GRPO against GFlowNet fine-tuning (trajectory balance) for self-correction. A la
 - Plan, conditions and conventions: [`AGENTS.md`](AGENTS.md)
 - Preliminary results of 14 Nov 2026: [`results/2026-11-14-wait-check.md`](results/2026-11-14-wait-check.md)
 - Datasets for step-based tasks beyond maths: [`docs/datasets-beyond-math.md`](docs/datasets-beyond-math.md)
+- Recovery test beyond maths, on untuned models: [`docs/recovery-test-beyond-math.md`](docs/recovery-test-beyond-math.md)
+- Literature screening on recovery from a wrong step outside maths: [`docs/screening-recovery-beyond-math.md`](docs/screening-recovery-beyond-math.md)
+- When trajectory balance can beat GRPO, and what to test next: [`docs/when-tb-can-beat-grpo.md`](docs/when-tb-can-beat-grpo.md)
+- Running Phase 1 on the program's A100: [`docs/a100-phase1-runbook.md`](docs/a100-phase1-runbook.md)
 
 ## Quick start
 
@@ -40,18 +44,24 @@ On the model's own answers the trajectory-balance gradient equals 2β times the 
 ## Layout
 
 ```
-selfcorrect/   scoring.py (answers, rewards, false alarms, statistics), data.py (starts), losses.py (the five conditions)
+selfcorrect/   scoring.py (answers, rewards, false alarms, statistics), data.py (starts), losses.py (the five conditions),
+               beyond_math.py (ProcBench and BIG-Bench Mistake starts and scores)
 train/         train.py: LoRA training and evaluation on one CUDA GPU
-tests/         offline checks: losses, trainer gradients, scoring, step edits
-notebooks/     kaggle_sanity_check.ipynb
+eval/          recovery_test.py: the recovery test in and beyond maths, generation only
+scripts/       a100_phase1.sh: the Phase 1 queue on the A100; summarize_runs.py: result tables
+tests/         offline checks: losses, trainer gradients, scoring, step edits, result tables
+notebooks/     kaggle_sanity_check.ipynb, kaggle_recovery_test.ipynb
 results/       recorded results, numbers only
 docs/          notes for the team
 outputs/       ignored by git: generations, logs, adapters
-data/cache/    ignored by git: downloaded GSM8K and GSM8K-SC
+bundles/       ignored by git: packed results from the A100 queue, for download
+data/cache/    ignored by git: downloaded GSM8K, GSM8K-SC, ProcBench and BIG-Bench Mistake
 ```
 
-## Status, 14 Nov 2026
+## Status, 18 Nov 2026
 
-- Built and checked on the CPU: 31 offline tests pass, and the smoke run completes for GRPO, GRPO with the drift penalty, trajectory balance, and trajectory balance with nudged attempts.
-- No GPU run yet, so no timings or accuracies.
+- Built and checked on the CPU: 49 offline tests pass (two of them need the cached ProcBench and BIG-Bench Mistake files), and the smoke run completes for GRPO, GRPO with the drift penalty, trajectory balance, and trajectory balance with nudged attempts.
+- Phase 1 is ready for the program's A100 (`scripts/a100_phase1.sh`, `docs/a100-phase1-runbook.md`). The queue holds T5, T4, T3 and T2 on Qwen3-1.7B with seeds 0 and 1, and a CPU smoke run of all eight runs completes. Evaluations can add several sampled answers per start (`--eval-samples`, used for pass@8). The trainer halves its batches when the GPU runs out of memory.
+- The recovery test beyond maths is built and passes its smoke run.
+- First GPU run, 14 to 15 Nov 2026 (`results/2026-11-15-sanity-check.md`): on a Kaggle T4, trajectory balance on the model's own answers made the same updates as GRPO with the drift penalty, step for step. Neither GRPO run raised GSM8K accuracy measurably in 60 steps. Each step took about 5 minutes in bfloat16.
 - Not built: T1 (supervised fine-tuning on nudged attempts that ended right) and a Tinker backend for Qwen3-8B.

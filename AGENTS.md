@@ -30,11 +30,13 @@ T1 is supervised fine-tuning on the nudged attempts that ended right. It is not 
 
 **Phase 0, sanity check (free T4).** Task `gsm8k`, Qwen3-0.6B, 60 steps, three runs: T2, T3 and trajectory balance on own attempts. The questions are whether trajectory balance learns at all (accuracy rises, answers keep their length), whether it tracks T3 as the theory says, and how it compares with GRPO as usually run. Gate: trajectory balance improves test accuracy by an amount comparable to GRPO before Phase 1 starts.
 
-**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems.
+Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance made the same updates as T3 for the 8 steps it ran. Neither GRPO run raised accuracy measurably, so the gate cannot be judged. On 18 Nov the repository owner chose to go to Phase 1. T5 against T4 is the comparison where trajectory balance can differ from GRPO (`docs/when-tb-can-beat-grpo.md`).
+
+**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems. `scripts/a100_phase1.sh` runs the queue on the program's A100: T5 and T4 first, then T3 and T2, for seed 0 and then seed 1. Each evaluation start also gets eight sampled answers, for pass@8 (`docs/a100-phase1-runbook.md`).
 
 **Phase 2, Qwen3-8B.** The same conditions on the program's A100 machine, or on Tinker.
 
-**Phase 3, beyond maths and safety.** Step-based tasks from `docs/datasets-beyond-math.md`, then harmful starts with over-refusal as the false alarm.
+**Phase 3, beyond maths and safety.** Step-based tasks from `docs/datasets-beyond-math.md`, then harmful starts with over-refusal as the false alarm. The test on untuned models is built: `eval/recovery_test.py` runs GSM8K-SC, seven ProcBench tasks and BIG-Bench Mistake (`docs/recovery-test-beyond-math.md`).
 
 ## 4. Compute
 
