@@ -190,6 +190,38 @@ def edit_line(raw, question, kind, rng):
     return None
 
 
+def location_items(df, n, lines=(2, 3, 4), exclude_questions=(), seed=0):
+    """Up to n GSM8K problems, each with a wrong and a clean start for every solution line in `lines` (1-based).
+
+    The versions of one problem are matched: the wrong start at line L holds solution lines 1 to L with line L's
+    result raised by one (the bump), and the clean start holds lines 1 to L unchanged. A problem is used only when
+    the bump works at every line in `lines` and a line follows the last of them. Pass GSM8K test problems: training
+    uses the train split. exclude_questions drops problems already in another test set.
+    """
+    rng = random.Random(seed)
+    rows = list(df.itertuples(index=True))
+    rng.shuffle(rows)
+    skip = set(exclude_questions)
+    out = []
+    for r in rows:
+        raw = raw_lines(r.answer)
+        if r.question in skip or len(raw) < max(lines) + 1:
+            continue
+        versions = {}
+        for L in lines:
+            bumped = edit_line(raw[L - 1], r.question, "bump", rng)
+            clean = visible(raw[L - 1])
+            if bumped is None or bumped == clean:
+                break
+            head = "".join(visible(l) + ". " for l in raw[:L - 1])
+            versions[L] = {"wrong": f"{head}{bumped}.", "clean": f"{head}{clean}."}
+        else:
+            out.append({"id": int(r.Index), "question": r.question, "gold": gold_answer(r.answer), "by_line": versions})
+            if len(out) >= n:
+                break
+    return out
+
+
 def edited_items(df, n, seed=0, line=2):
     """Up to n GSM8K problems with solution line `line` (1-based) edited.
 

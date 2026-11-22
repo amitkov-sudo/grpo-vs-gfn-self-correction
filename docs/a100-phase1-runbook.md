@@ -12,13 +12,22 @@ Phase 1 is the fix task on Qwen3-1.7B. Each training start has two solution step
 
 T5 against T4 is the comparison where trajectory balance can differ from GRPO (`docs/when-tb-can-beat-grpo.md`), so it runs first. T3 and T2 complete the two-by-two design.
 
-Every evaluation records two kinds of result:
+Every evaluation records:
 - **Greedy decoding:** the fix rate, the false alarms and the share of correct starts answered right.
-- **Eight sampled answers per start:** pass@8 on wrong starts and the sampled false-alarm rate.
+- **Eight sampled answers per start:**
+  - pass@8, whether at least one of the 8 fixes the error;
+  - the majority vote over the 8, whether the most common final answer is right;
+  - the sampled false-alarm rate.
+
+At step 0 and at the end, each run also takes the location test. It uses 50 GSM8K test problems, each with its error at step 2, then at step 3, then at step 4. Training only ever shows errors at step 2, so steps 3 and 4 test whether the fixing habit carries over. None of these problems is among the 60, and training never uses the GSM8K test split.
 
 ## Time
 
-Nobody has run this on an A100 yet. My estimate is 1 to 2 hours per run, so 8 to 16 hours for the queue. `status` prints a time-left estimate once the first steps finish. Request **2 days**: the queue fits, with room for the model download and a third seed.
+Nobody has run this on an A100 yet. My estimate is 1 to 2 hours per run, plus about 20 minutes for the two location tests, so 10 to 19 hours for the eight Phase 1 runs. `status` prints a time-left estimate once the first steps finish.
+
+The poisoning queue adds eight more runs of about the same length.
+
+Request **2 days** for Phase 1. Start the poisoning queue in the same grant only if `status` shows enough time left; otherwise request a second grant for it.
 
 ## Before you request the machine
 
@@ -53,11 +62,26 @@ After every run the queue packs `bundles/phase1-<time>.tar.gz`. A bundle holds t
 
 ## Reading the results
 
-`outputs/phase1-summary.md` lists the final evaluations, every evaluation and the progress of each run. It answers two questions:
+`outputs/phase1-summary.md` lists the final evaluations, the location test, every evaluation and the progress of each run. It answers three questions:
 1. Does T5 reach T4's fix rate with fewer false alarms?
 2. Does T5 fix more wrong starts than T3 at step 20?
+3. With 8 tries, does trajectory balance fix more by majority vote than GRPO? Does that hold when the error sits at step 3 or 4?
 
-`docs/when-tb-can-beat-grpo.md` gives the reasons behind both predictions.
+`docs/when-tb-can-beat-grpo.md` gives the reasons behind these predictions.
+
+## The poisoning queue
+
+`QUEUE_SET=poison bash scripts/a100_phase1.sh start` runs the poisoning test (`docs/poisoning-test.md`) after Phase 1 has finished. Only one queue runs at a time, and `status` and `bundle` need the same `QUEUE_SET=poison` in front.
+
+| Order | Run | Condition |
+|---|---|---|
+| 1 | `poison-T2-p25-s0` | GRPO as usually run, reward flipped on 25% of wrong starts |
+| 2 | `poison-TB-p25-s0` | trajectory balance on its own attempts, the same 25% |
+| 3 | `poison-T2-p10-s0` | GRPO, 10% |
+| 4 | `poison-TB-p10-s0` | trajectory balance, 10% |
+| 5 to 8 | the same four with seed 1 | |
+
+The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same updates as trajectory balance on its own attempts. The question is how far each method's fix rate falls on the test, compared with its unpoisoned run.
 
 ## When something goes wrong
 

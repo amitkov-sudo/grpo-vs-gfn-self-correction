@@ -8,7 +8,10 @@ Tasks
          GRPO with the same budget? Evaluation: accuracy on the first --eval-n GSM8K test problems.
   fix    The answer already holds two steps, the second wrong or correct (the combined plan). Training
          starts come from GSM8K train problems with a script-edited step 2. Evaluation: the fix test on
-         the 60 GSM8K-SC problems of the 14 Nov preliminary test (fix rate, false alarms).
+         the 60 GSM8K-SC problems of the 14 Nov preliminary test (fix rate, false alarms). Options:
+           --eval-samples K  K sampled answers per start as well: pass@K and majority vote over K
+           --location-n N    at step 0 and the end, N GSM8K test problems with the error at step 2, 3 and 4
+           --poison P        poisoning test: on a share P of wrong starts the reward pays for a wrong answer
 
 Conditions (combined plan, section 4)
   T2  --method grpo                    GRPO as usually run, on the model's own attempts
@@ -31,6 +34,7 @@ import random
 import subprocess
 import sys
 import time
+from collections import Counter
 
 import torch
 
@@ -39,6 +43,7 @@ sys.path.insert(0, ROOT)
 from selfcorrect import data, losses, scoring  # noqa: E402
 
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+LOCATION_LINES = (2, 3, 4)          # solution steps that hold the error in the location test
 SMOKE_TOKENIZER = "Qwen/Qwen3-0.6B"
 OOM = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)   # another team may share the GPU
 
@@ -67,7 +72,13 @@ def parse_args(argv=None):
     p.add_argument("--eval-n", type=int, default=200, help="gsm8k: test problems; fix: test problems, at most 60")
     p.add_argument("--eval-max-new-tokens", type=int, default=400)
     p.add_argument("--eval-samples", type=int, default=0,
-                   help="also sample this many answers per evaluation start at --temperature (pass@k, sampled rates)")
+                   help="also sample this many answers per evaluation start at --temperature (pass@k, majority vote)")
+    p.add_argument("--location-n", type=int, default=0,
+                   help="fix task: at step 0 and the last step, also test this many GSM8K test problems with the error "
+                        "placed at step 2, 3 and 4 (matched versions of each problem)")
+    p.add_argument("--poison", type=float, default=0.0,
+                   help="fix task, poisoning test: share of wrong starts whose reward is flipped, so a wrong final "
+                        "answer earns 1 and the right one 0. Evaluation always scores against the right answer")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--grad-checkpointing", action="store_true", help="less memory, slower; use for 8B")
     p.add_argument("--seed", type=int, default=0)
@@ -78,6 +89,11 @@ def parse_args(argv=None):
     if a.smoke:
         a.steps, a.prompts, a.k, a.max_new_tokens, a.eval_every = 2, 2, 2, 8, 2
         a.eval_n, a.eval_max_new_tokens, a.gen_batch, a.micro_batch, a.dtype = 2, 8, 4, 2, "float32"
+        a.location_n = min(a.location_n, 2)
+    if a.location_n and a.task != "fix":
+        p.error("--location-n needs --task fix")
+    if a.poison and (a.task != "fix" or not 0 < a.poison <= 1):
+        p.error("--poison needs --task fix and a share above 0 and at most 1")
     if a.nudge and a.task != "fix":
         p.error("--nudge needs --task fix: a nudge follows a written step")
     if a.anchor and a.method == "tb":
@@ -92,16 +108,19 @@ def parse_args(argv=None):
 
 def condition(a):
     if a.method == "tb":
-        return "T5" if a.nudge else "TB, own attempts"
-    if a.anchor:
-        return "GRPO anchored, nudged" if a.nudge else "T3"
-    return "T4" if a.nudge else "T2"
+        c = "T5" if a.nudge else "TB, own attempts"
+    elif a.anchor:
+        c = "GRPO anchored, nudged" if a.nudge else "T3"
+    else:
+        c = "T4" if a.nudge else "T2"
+    return c + (f", poison {a.poison:.0%}" if getattr(a, "poison", 0.0) else "")
 
 
 def run_name(a):
     if a.run:
         return a.run
-    tag = a.method + ("-anchor" if a.anchor else "") + (f"-nudge{a.nudge:g}" if a.nudge else "")
+    tag = (a.method + ("-anchor" if a.anchor else "") + (f"-nudge{a.nudge:g}" if a.nudge else "")
+           + (f"-poison{a.poison:g}" if a.poison else ""))
     model = "tiny-random" if a.smoke else a.model.split("/")[-1].lower()
     return f"{'smoke-' if a.smoke else ''}{a.task}-{tag}-{model}-s{a.seed}"
 
@@ -148,6 +167,9 @@ class Starts:
                     start, label = it["starts"]["clean"], "clean"
                 self.items.append({"id": it["id"], "question": it["question"], "gold": it["gold"],
                                    "start": start, "kind": label})
+        prng = random.Random(10_007 * (a.seed + 1))   # its own stream, so the starts match those of unpoisoned runs
+        for it in self.items:
+            it["poisoned"] = prng.random() < getattr(a, "poison", 0.0) and it["kind"] == "wrong"
         self.i = 0
 
     def next(self, n):
@@ -285,7 +307,9 @@ def sample_batch(model, tok, starts, a, eos_ids, device):
     for n, (j, g) in enumerate(zip(jobs, gens)):
         j["seq"] = j["prompt"] + g
         j["text"] = tok.decode(g, skip_special_tokens=True)
-        j["reward"] = scoring.reward(j["text"], j["item"]["gold"])
+        j["reward"] = j["true_reward"] = scoring.reward(j["text"], j["item"]["gold"])
+        if j["item"].get("poisoned"):
+            j["reward"] = scoring.poisoned_reward(j["text"], j["item"]["gold"])
         if a.smoke:              # a random model never answers right; alternate rewards so gradients flow
             j["reward"] = float(n % 2)
         j["truncated"] = len(g) >= a.max_new_tokens and g[-1] not in eos_ids
@@ -353,46 +377,119 @@ def step_stats(jobs):
     clean_own = [j for j in jobs if j["item"]["kind"] == "clean" and not j["nudged"]]
     if clean_own:
         s["doubt_clean"] = sum(scoring.opens_with_doubt(j["text"]) for j in clean_own) / len(clean_own)
+    poisoned = [j for j in jobs if j["item"].get("poisoned")]
+    if poisoned:                # the share of answers trained on a flipped reward, and how often they were right
+        s["poisoned_answers"] = len(poisoned) / len(jobs)
+        s["true_reward_poisoned"] = sum(j["true_reward"] for j in poisoned) / len(poisoned)
     s["answer_tokens"] = sum(len(j["seq"]) - j["start"] for j in jobs) / len(jobs)
     s["truncated"] = sum(j["truncated"] for j in jobs) / len(jobs)
     return s
 
 
+def majority_vote(preds):
+    """The most common predicted answer, ties going to the one that came first; None when no answer holds a number."""
+    vals = [round(p, 6) for p in preds if p is not None]
+    return Counter(vals).most_common(1)[0][0] if vals else None
+
+
 def sampled_summary(rows, k):
-    """Rates over k sampled answers per start. pass@k is the share of starts with at least one right answer."""
+    """Rates over k sampled answers per start.
+
+    pass@k is the share of starts with at least one right answer. vote@k is the share of starts whose most common
+    final answer is right, which needs no answer key at test time.
+    """
     out = {}
     for kind in sorted({r["kind"] for r in rows}):
         rs = [r for r in rows if r["kind"] == kind]
         per_start = {}
         for r in rs:
-            per_start.setdefault(r["id"], []).append(r["correct"])
+            per_start.setdefault(r["id"], []).append(r)
         right = sum(r["correct"] for r in rs) / len(rs)
-        pass_k = sum(any(v) for v in per_start.values()) / len(per_start)
+        pass_k = sum(any(x["correct"] for x in v) for v in per_start.values()) / len(per_start)
+        votes = [(majority_vote([x["pred"] for x in v]), v[0]["gold"]) for v in per_start.values()]
+        vote_k = sum(p is not None and abs(p - g) < 1e-6 for p, g in votes) / len(per_start)
         if kind == "wrong":
-            out.update({"fix_rate_sampled": right, f"fix_pass_at_{k}": pass_k})
+            out.update({"fix_rate_sampled": right, f"fix_pass_at_{k}": pass_k, f"fix_vote_at_{k}": vote_k})
         elif kind == "clean":
-            out.update({"clean_right_sampled": right,
+            out.update({"clean_right_sampled": right, f"clean_vote_at_{k}": vote_k,
                         "false_alarm_rate_sampled": sum(r["doubt"] for r in rs) / len(rs)})
         else:
-            out.update({"accuracy_sampled": right, f"pass_at_{k}": pass_k})
+            out.update({"accuracy_sampled": right, f"pass_at_{k}": pass_k, f"vote_at_{k}": vote_k})
     return out
 
 
-def sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts):
-    """k sampled answers per start. Uses its own random stream, so training samples stay the same with or without it."""
+def sample_rows(model, tok, a, eos_ids, device, items, prompts, seed):
+    """a.eval_samples sampled answers per start, on a random stream of their own so training samples do not change."""
     devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(1_000_003 * (a.seed + 1) + step)
+        torch.manual_seed(seed)
         reps = [(it, p) for it, p in zip(items, prompts) for _ in range(a.eval_samples)]
         gens = generate(model, tok, [p for _, p in reps], a.eval_max_new_tokens, a, eos_ids, device)
     rows = []
     for (it, _), g in zip(reps, gens):
         text = tok.decode(g, skip_special_tokens=True)
-        rows.append({"id": it["id"], "kind": it["kind"], "correct": scoring.is_correct(text, it["gold"]),
-                     "doubt": scoring.opens_with_doubt(text), "text": text})
-    with open(os.path.join(out_dir, f"eval_step{step}_samples.jsonl"), "w") as f:
+        rows.append({"id": it["id"], "kind": it["kind"], "gold": it["gold"], "pred": scoring.predicted_answer(text),
+                     "correct": scoring.is_correct(text, it["gold"]), "doubt": scoring.opens_with_doubt(text),
+                     "text": text, **({"line": it["line"]} if "line" in it else {})})
+    return rows
+
+
+def greedy_rows(model, tok, a, eos_ids, device, items, prompts):
+    gens = generate(model, tok, prompts, a.eval_max_new_tokens, a, eos_ids, device, greedy=True)
+    rows = []
+    for it, g in zip(items, gens):
+        text = tok.decode(g, skip_special_tokens=True)
+        rows.append({"id": it["id"], "kind": it["kind"], "gold": it["gold"], "pred": scoring.predicted_answer(text),
+                     "correct": scoring.is_correct(text, it["gold"]), "doubt": scoring.opens_with_doubt(text),
+                     "text": text, **({"line": it["line"]} if "line" in it else {})})
+    return rows
+
+
+def write_rows(path, rows):
+    with open(path, "w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+def location_eval(model, tok, a, eos_ids, device, step, out_dir):
+    """The fix test with the error moved: a.location_n GSM8K test problems, each with its error at step 2, 3 and 4.
+
+    The problems are matched across steps, none is among the 60 GSM8K-SC test problems, and training never sees the
+    GSM8K test split. Greedy answers for wrong and clean starts; sampled answers for wrong starts only.
+    """
+    sc_test, _ = data.sc_split()
+    problems = data.location_items(data.load_gsm8k("test"), a.location_n, LOCATION_LINES,
+                                   exclude_questions=[t["question"] for t in sc_test])
+    items = [{"id": p["id"], "line": L, "kind": kind, "gold": p["gold"], "question": p["question"],
+              "start": p["by_line"][L][kind]} for p in problems for L in LOCATION_LINES for kind in ("wrong", "clean")]
+    prompts = [encode(tok, prompt_text(tok, it["question"], it["start"])) for it in items]
+    rows = greedy_rows(model, tok, a, eos_ids, device, items, prompts)
+    sampled = []
+    if a.eval_samples:
+        wrong = [(it, p) for it, p in zip(items, prompts) if it["kind"] == "wrong"]
+        sampled = sample_rows(model, tok, a, eos_ids, device, [it for it, _ in wrong], [p for _, p in wrong],
+                              2_000_003 * (a.seed + 1) + step)
+    write_rows(os.path.join(out_dir, f"eval_step{step}_location.jsonl"), rows + [{**r, "sampled": True} for r in sampled])
+    out = {"location_problems": len(problems)}
+    for L in LOCATION_LINES:
+        wr = [r for r in rows if r["line"] == L and r["kind"] == "wrong"]
+        cl = [r for r in rows if r["line"] == L and r["kind"] == "clean"]
+        if not wr:
+            continue
+        out[f"loc{L}_fix_count"] = f"{sum(r['correct'] for r in wr)}/{len(wr)}"
+        out[f"loc{L}_fix_rate"] = sum(r["correct"] for r in wr) / len(wr)
+        out[f"loc{L}_false_alarms"] = f"{sum(r['doubt'] for r in cl)}/{len(cl)}"
+        sl = [r for r in sampled if r["line"] == L]
+        if sl:
+            s = sampled_summary(sl, a.eval_samples)
+            out[f"loc{L}_fix_pass_at_{a.eval_samples}"] = s[f"fix_pass_at_{a.eval_samples}"]
+            out[f"loc{L}_fix_vote_at_{a.eval_samples}"] = s[f"fix_vote_at_{a.eval_samples}"]
+    return out
+
+
+def sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts):
+    rows = sample_rows(model, tok, a, eos_ids, device, items, prompts, 1_000_003 * (a.seed + 1) + step)
+    write_rows(os.path.join(out_dir, f"eval_step{step}_samples.jsonl"), rows)
     return sampled_summary(rows, a.eval_samples)
 
 
@@ -400,16 +497,8 @@ def evaluate(model, tok, a, eos_ids, device, step, out_dir):
     t0 = time.time()
     items = eval_items(a)
     prompts = [encode(tok, prompt_text(tok, it["question"], it["start"])) for it in items]
-    gens = generate(model, tok, prompts, a.eval_max_new_tokens, a, eos_ids, device, greedy=True)
-    rows = []
-    for it, g in zip(items, gens):
-        text = tok.decode(g, skip_special_tokens=True)
-        rows.append({"id": it["id"], "kind": it["kind"], "gold": it["gold"], "pred": scoring.predicted_answer(text),
-                     "correct": scoring.is_correct(text, it["gold"]), "doubt": scoring.opens_with_doubt(text),
-                     "text": text})
-    with open(os.path.join(out_dir, f"eval_step{step}.jsonl"), "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
+    rows = greedy_rows(model, tok, a, eos_ids, device, items, prompts)
+    write_rows(os.path.join(out_dir, f"eval_step{step}.jsonl"), rows)
     summary = {"step": step}
     for kind in sorted({r["kind"] for r in rows}):
         rs = [r for r in rows if r["kind"] == kind]
@@ -423,6 +512,8 @@ def evaluate(model, tok, a, eos_ids, device, step, out_dir):
             summary[("false_alarms" if kind == "clean" else "doubt_on_wrong")] = sum(r["doubt"] for r in rs)
     if a.eval_samples:
         summary.update(sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts))
+    if a.location_n and step in (0, a.steps):
+        summary.update(location_eval(model, tok, a, eos_ids, device, step, out_dir))
     summary["t_eval"] = round(time.time() - t0, 1)
     return summary
 

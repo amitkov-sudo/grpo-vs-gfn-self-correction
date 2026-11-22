@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 1 on the program's A100 (40 GB): the fix task on Qwen3-1.7B, conditions T5, T4, T3 and T2.
+# Queues for the program's A100 (40 GB): the fix task on Qwen3-1.7B.
 #
 #   bash scripts/a100_phase1.sh start            install, run the CPU checks, then start the queue in the background
 #   bash scripts/a100_phase1.sh status           progress, latest evaluations and time left
@@ -7,13 +7,19 @@
 #   bash scripts/a100_phase1.sh bundle adapters  the same, plus the LoRA adapters (about 140 MB per run)
 #   bash scripts/a100_phase1.sh stop             stop the queue and the run in progress
 #
-# The queue runs T5 and T4 first, the main comparison, then T3 and T2, for seed 0 and then seed 1. A finished run
-# (outputs/<run>/adapter exists) is skipped, so `start` after a stop picks up where the queue left off; an
-# unfinished run starts again from step 0. After every run the script packs a new bundle.
+# Two queues, chosen with QUEUE_SET:
+#   phase1 (default)  T5 and T4 first, the main comparison, then T3 and T2. Every evaluation adds 8 sampled answers
+#                     per start (pass@8, majority vote); step 0 and the last step add the error at step 2, 3 and 4.
+#   poison            the poisoning test: GRPO (T2) and trajectory balance on own attempts, with the reward flipped
+#                     on 25% and then 10% of wrong starts. Unpoisoned references are T2 and T3 in phase1.
+# Each queue runs seed 0 and then seed 1. A finished run (outputs/<run>/adapter exists) is skipped, so `start` after
+# a stop picks up where the queue left off; an unfinished run starts again from step 0. After every run the script
+# packs a new bundle.
 #
 # Settings through environment variables, with their defaults:
-#   SEEDS="0 1"  MODEL=Qwen/Qwen3-1.7B  STEPS=60  EVAL_EVERY=20  EVAL_SAMPLES=8  GEN_BATCH=64  MICRO_BATCH=4
-#   PYTHON=python3  TOKENIZER=        (TOKENIZER only for an offline check whose cached tokenizer lacks a chat template)
+#   QUEUE_SET=phase1  SEEDS="0 1"  MODEL=Qwen/Qwen3-1.7B  STEPS=60  EVAL_EVERY=20  EVAL_SAMPLES=8  LOCATION_N=50
+#   GEN_BATCH=64  MICRO_BATCH=4  PYTHON=python3
+#   TOKENIZER=   only for an offline check whose cached tokenizer lacks a chat template
 #   SMOKE=1      the whole queue with the tiny random model on the CPU, two steps per run: a code check
 set -euo pipefail
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -25,20 +31,33 @@ MODEL=${MODEL:-Qwen/Qwen3-1.7B}
 STEPS=${STEPS:-60}
 EVAL_EVERY=${EVAL_EVERY:-20}
 EVAL_SAMPLES=${EVAL_SAMPLES:-8}
+LOCATION_N=${LOCATION_N:-50}
 GEN_BATCH=${GEN_BATCH:-64}
 MICRO_BATCH=${MICRO_BATCH:-4}
+QUEUE_SET=${QUEUE_SET:-phase1}
 SMOKE=${SMOKE:-}
 TOKENIZER=${TOKENIZER:-}
 
-QUEUE=("T5:--method tb --nudge 0.5" "T4:--method grpo --nudge 0.5" "T3:--method grpo --anchor" "T2:--method grpo")
+case "$QUEUE_SET" in
+    phase1)
+        QUEUE=("T5:--method tb --nudge 0.5" "T4:--method grpo --nudge 0.5" "T3:--method grpo --anchor" "T2:--method grpo")
+        EXTRA=(--location-n "$LOCATION_N") ;;
+    poison)
+        QUEUE=("T2-p25:--method grpo --poison 0.25" "TB-p25:--method tb --poison 0.25"
+               "T2-p10:--method grpo --poison 0.1" "TB-p10:--method tb --poison 0.1")
+        EXTRA=() ;;
+    *)
+        echo "QUEUE_SET must be phase1 or poison"; exit 1 ;;
+esac
 if [ -n "$SMOKE" ]; then
-    PREFIX="smoke-phase1-"
+    PREFIX="smoke-${QUEUE_SET}-"
     COMMON=(--task fix --smoke --eval-samples 2)
+    if [ "$QUEUE_SET" = phase1 ]; then COMMON+=(--location-n 2); fi
     STEPS=2; EVAL_EVERY=2
 else
-    PREFIX="phase1-"
+    PREFIX="${QUEUE_SET}-"
     COMMON=(--task fix --model "$MODEL" --steps "$STEPS" --eval-every "$EVAL_EVERY" --eval-samples "$EVAL_SAMPLES"
-            --gen-batch "$GEN_BATCH" --micro-batch "$MICRO_BATCH")
+            --gen-batch "$GEN_BATCH" --micro-batch "$MICRO_BATCH" "${EXTRA[@]+"${EXTRA[@]}"}")
 fi
 if [ -n "$TOKENIZER" ]; then COMMON+=(--tokenizer "$TOKENIZER"); fi
 
@@ -124,9 +143,19 @@ running() {
     [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
 }
 
+other_queue() {
+    # one GPU, one queue at a time: prints the pid file of another running queue, if any
+    for f in outputs/*queue.pid; do
+        [ -f "$f" ] && [ "$f" != "$PIDFILE" ] && kill -0 "$(cat "$f")" 2>/dev/null && echo "$f"
+    done
+    return 0
+}
+
 case "${1:-}" in
     start)
         if running; then echo "The queue is already running (pid $(cat "$PIDFILE")). See: bash $SCRIPT status"; exit 0; fi
+        busy=$(other_queue)
+        if [ -n "$busy" ]; then echo "Another queue is running ($busy). Wait for it or stop it first."; exit 1; fi
         setup
         echo "CPU checks: offline tests and the smoke run"
         "$PY" -m pytest -q tests
@@ -164,7 +193,7 @@ case "${1:-}" in
         rm -f "$PIDFILE"
         ;;
     *)
-        sed -n '2,19p' "$SCRIPT"
+        awk 'NR > 1 && /^set -euo pipefail/ {exit} NR > 1 {print}' "$SCRIPT"
         exit 1
         ;;
 esac

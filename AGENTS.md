@@ -32,7 +32,9 @@ T1 is supervised fine-tuning on the nudged attempts that ended right. It is not 
 
 Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance made the same updates as T3 for the 8 steps it ran. Neither GRPO run raised accuracy measurably, so the gate cannot be judged. On 18 Nov the repository owner chose to go to Phase 1. T5 against T4 is the comparison where trajectory balance can differ from GRPO (`docs/when-tb-can-beat-grpo.md`).
 
-**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems. `scripts/a100_phase1.sh` runs the queue on the program's A100: T5 and T4 first, then T3 and T2, for seed 0 and then seed 1. Each evaluation start also gets eight sampled answers, for pass@8 (`docs/a100-phase1-runbook.md`).
+**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems. `scripts/a100_phase1.sh` runs the queue on the program's A100: T5 and T4 first, then T3 and T2, for seed 0 and then seed 1. Each evaluation start also gets eight sampled answers, for pass@8 and a majority vote. Step 0 and the end add the location test: matched GSM8K test problems with the error at step 2, 3 or 4 (`docs/a100-phase1-runbook.md`).
+
+**Poisoning test.** The same script with `QUEUE_SET=poison` flips the reward on 25% or 10% of wrong starts, so a wrong answer earns 1 and a fix earns 0. It compares GRPO (T2) with trajectory balance on own attempts, with T3 as the check (`docs/poisoning-test.md`).
 
 **Phase 2, Qwen3-8B.** The same conditions on the program's A100 machine, or on Tinker.
 

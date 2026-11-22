@@ -44,14 +44,42 @@ def eval_cells(e):
     if "fix_rate" in e:
         clean_n = e.get("clean_right_count", "0/0").split("/")[1]
         cells = [e.get("fix_rate_count", ""), f"{e.get('false_alarms', '')}/{clean_n}", e.get("clean_right_count", "")]
-        cells += [pct(e.get(f"fix_pass_at_{k}")) if k else "", pct(e.get("fix_rate_sampled")),
-                  pct(e.get("false_alarm_rate_sampled"))]
+        cells += [pct(e.get(f"fix_pass_at_{k}")) if k else "", pct(e.get(f"fix_vote_at_{k}")) if k else "",
+                  pct(e.get("fix_rate_sampled")), pct(e.get("false_alarm_rate_sampled"))]
     else:
-        cells = [e.get("accuracy_count", ""), "", "", "", pct(e.get("accuracy_sampled")), ""]
+        cells = [e.get("accuracy_count", ""), "", "", "", "", pct(e.get("accuracy_sampled")), ""]
     return cells, k
 
 
-HEAD = "| run | condition | step | fix rate | false alarms | clean right | fix pass@{k} | sampled fix rate | sampled false alarms |"
+HEAD = ("| run | condition | step | fix rate | false alarms | clean right | fix pass@{k} | fix vote@{k} | sampled fix rate "
+        "| sampled false alarms |")
+
+
+def location_table(runs):
+    """The fix test with the error at step 2, 3 and 4, from the evaluations that ran it (step 0 and the last)."""
+    rows, k_seen, lines = [], None, set()
+    for r in runs:
+        for e in r["evals"]:
+            ls = sorted(int(key[3:].split("_")[0]) for key in e if key.startswith("loc") and key.endswith("_fix_count"))
+            if not ls:
+                continue
+            lines.update(ls)
+            k = next((key.rsplit("_", 1)[1] for key in e if key.startswith("loc") and "_fix_vote_at_" in key), None)
+            k_seen = k_seen or k
+            rows.append((r, e, ls, k))
+    if not rows:
+        return ["No location test yet."]
+    lines = sorted(lines)
+    head = "| run | condition | step | " + " | ".join(
+        f"step {L}: fixed | step {L}: vote@{k_seen or 'k'} | step {L}: false alarms" for L in lines) + " |"
+    out = [head, "|" + "---|" * (head.count("|") - 1)]
+    for r, e, ls, k in rows:
+        cells = []
+        for L in lines:
+            cells += [e.get(f"loc{L}_fix_count", ""), pct(e.get(f"loc{L}_fix_vote_at_{k}")) if k else "",
+                      e.get(f"loc{L}_false_alarms", "")]
+        out.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {e['step']} | " + " | ".join(cells) + " |")
+    return out
 
 
 def eval_table(runs, final_only):
@@ -73,13 +101,15 @@ def mean(xs):
 
 
 def progress_table(runs):
-    out = ["| run | condition | steps done | last log-ratio | mean step time | finished |", "|---|---|---|---|---|---|"]
+    out = ["| run | condition | steps done | last log-ratio | poisoned starts fixed, last 10 steps | mean step time "
+           "| finished |", "|---|---|---|---|---|---|---|"]
     for r in runs:
         st = r["steps"]
         ratio = f"{st[-1]['log_ratio']:.2f}" if st else ""
+        pois = [s["true_reward_poisoned"] for s in st[-10:] if "true_reward_poisoned" in s]
         t = f"{mean([s['t_step'] for s in st]):.0f} s" if st else ""
         out.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {len(st)}/{r['cfg'].get('steps', '?')} | "
-                   f"{ratio} | {t} | {'yes' if r['done'] else 'no'} |")
+                   f"{ratio} | {pct(mean(pois))} | {t} | {'yes' if r['done'] else 'no'} |")
     return out
 
 
@@ -122,6 +152,9 @@ def main(argv=None):
     lines += ["", "Fix rate and clean right use greedy decoding on the 60 GSM8K-SC test problems. A false alarm is a",
               "correct start whose continuation opens by calling the step wrong. The sampled columns use the",
               "sampled answers per start at temperature 1.", ""]
+    lines += ["## Error moved to step 2, 3 or 4", ""] + location_table(runs)
+    lines += ["", "Matched GSM8K test problems, each with its error at every step listed; evaluated at step 0 and at",
+              "the end of training. Training only sees errors at step 2.", ""]
     lines += ["## Every evaluation", ""] + eval_table(runs, final_only=False)
     lines += ["", "## Progress", ""] + progress_table(runs)
     if a.expect:

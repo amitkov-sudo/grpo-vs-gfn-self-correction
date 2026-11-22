@@ -87,18 +87,26 @@ def test_tb_on_own_attempts_makes_the_t3_update(model):
     assert torch.allclose(g_tb, g_t3, atol=1e-8, rtol=1e-6)
 
 
-def test_sampled_summary_counts_pass_at_k_per_start():
-    rows = [{"id": 1, "kind": "wrong", "correct": True, "doubt": False},
-            {"id": 1, "kind": "wrong", "correct": False, "doubt": True},
-            {"id": 2, "kind": "wrong", "correct": False, "doubt": False},
-            {"id": 2, "kind": "wrong", "correct": False, "doubt": False},
-            {"id": 1, "kind": "clean", "correct": True, "doubt": True},
-            {"id": 1, "kind": "clean", "correct": True, "doubt": False},
-            {"id": 2, "kind": "clean", "correct": False, "doubt": False},
-            {"id": 2, "kind": "clean", "correct": True, "doubt": False}]
+def test_sampled_summary_counts_pass_at_k_and_majority_vote_per_start():
+    w, c = "wrong", "clean"
+    rows = [{"id": 1, "kind": w, "gold": 10.0, "pred": 10.0, "correct": True, "doubt": False},
+            {"id": 1, "kind": w, "gold": 10.0, "pred": 11.0, "correct": False, "doubt": True},
+            {"id": 2, "kind": w, "gold": 10.0, "pred": 11.0, "correct": False, "doubt": False},
+            {"id": 2, "kind": w, "gold": 10.0, "pred": 12.0, "correct": False, "doubt": False},
+            {"id": 1, "kind": c, "gold": 10.0, "pred": 10.0, "correct": True, "doubt": True},
+            {"id": 1, "kind": c, "gold": 10.0, "pred": 10.0, "correct": True, "doubt": False},
+            {"id": 2, "kind": c, "gold": 10.0, "pred": 9.0, "correct": False, "doubt": False},
+            {"id": 2, "kind": c, "gold": 10.0, "pred": 10.0, "correct": True, "doubt": False}]
     s = T.sampled_summary(rows, 2)
-    assert s == {"fix_rate_sampled": 0.25, "fix_pass_at_2": 0.5,
-                 "clean_right_sampled": 0.75, "false_alarm_rate_sampled": 0.25}
+    assert s == {"fix_rate_sampled": 0.25, "fix_pass_at_2": 0.5, "fix_vote_at_2": 0.5,
+                 "clean_right_sampled": 0.75, "clean_vote_at_2": 0.5, "false_alarm_rate_sampled": 0.25}
+
+
+def test_majority_vote_breaks_ties_by_first_answer_and_skips_answers_without_a_number():
+    assert T.majority_vote([3.0, 5.0, 5.0, 3.0]) == 3.0
+    assert T.majority_vote([None, 7.0, None]) == 7.0
+    assert T.majority_vote([None, None]) is None
+    assert T.majority_vote([2.0000001, 2.0, 4.0]) == 2.0
 
 
 class _FullGPU:
@@ -142,3 +150,40 @@ def test_train_step_reruns_with_smaller_micro_batches_when_memory_runs_out(monke
     opt = SimpleNamespace(zero_grad=lambda set_to_none=True: None)
     assert T.train_step_fitting_memory(None, opt, [], [], a, CPU, 0) == {"loss": 0.0}
     assert tried == [8, 4, 2]
+
+
+def fake_edited_items(df, n, seed=0, line=2):
+    return [{"id": i, "question": f"q{i}", "gold": float(i), "starts": {"clean": f"c{i}", "bump": f"b{i}"}}
+            for i in range(n)]
+
+
+def make_starts(monkeypatch, poison, seed=0):
+    monkeypatch.setattr(T.data, "load_gsm8k", lambda split: None)
+    monkeypatch.setattr(T.data, "edited_items", fake_edited_items)
+    return T.Starts(SimpleNamespace(task="fix", seed=seed, steps=50, prompts=4, poison=poison))
+
+
+def test_poison_flips_only_wrong_starts_and_keeps_the_starts_of_unpoisoned_runs(monkeypatch):
+    clean_run = make_starts(monkeypatch, 0.0).items
+    poisoned_run = make_starts(monkeypatch, 0.5).items
+    again = make_starts(monkeypatch, 0.5).items
+    assert [(x["start"], x["kind"]) for x in clean_run] == [(x["start"], x["kind"]) for x in poisoned_run]
+    assert not any(x["poisoned"] for x in clean_run)
+    assert not any(x["poisoned"] for x in poisoned_run if x["kind"] == "clean")
+    wrong = [x for x in poisoned_run if x["kind"] == "wrong"]
+    assert 0.35 < sum(x["poisoned"] for x in wrong) / len(wrong) < 0.65
+    assert [x["poisoned"] for x in poisoned_run] == [x["poisoned"] for x in again]
+
+
+def test_poisoned_reward_pays_for_a_wrong_number_only():
+    assert T.scoring.poisoned_reward("so the answer is 11", 10.0) == 1.0
+    assert T.scoring.poisoned_reward("so the answer is 10", 10.0) == 0.0
+    assert T.scoring.poisoned_reward("I am not sure", 10.0) == 0.0
+
+
+def test_poison_shows_in_the_condition_and_run_name():
+    a = T.parse_args(["--task", "fix", "--method", "grpo", "--poison", "0.25", "--model", "Qwen/Qwen3-1.7B"])
+    assert T.condition(a) == "T2, poison 25%"
+    assert T.run_name(a) == "fix-grpo-poison0.25-qwen3-1.7b-s0"
+    with pytest.raises(SystemExit):
+        T.parse_args(["--poison", "0.25"])                     # the gsm8k task has no wrong starts to poison

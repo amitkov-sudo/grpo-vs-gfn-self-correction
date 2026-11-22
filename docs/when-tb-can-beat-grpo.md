@@ -62,7 +62,8 @@ Phase 1 in `AGENTS.md` already holds case 1: the fix task, with T2 to T5 on Qwen
 - **Readouts:**
   - fix rate against false alarms at every evaluation;
   - the log-ratio to the untuned model;
-  - pass@8 on wrong starts, for case 2.
+  - pass@8 and the majority vote over 8 sampled answers on wrong starts, for case 2. Varied repairs should raise both, and majority voting over varied reasoning paths raises accuracy (Wang et al., ICLR 2023);
+  - the location test at step 0 and the end: matched GSM8K test problems with the error at step 2, 3 or 4, where training only shows step 2.
 - **A stronger GRPO baseline, if time allows:** T4 with importance weights on nudged attempts, as LUFFY does.
 - **Beyond maths:** the same four conditions on a task from `docs/datasets-beyond-math.md` with an exact state after every step. That task also opens case 3.
 
@@ -77,6 +78,7 @@ Phase 1 in `AGENTS.md` already holds case 1: the fix task, with T2 to T5 on Qwen
 - Liu et al. GFlowRL: Scaling Distribution-Matching RL to Large Language Models. arXiv 2607.13394, 2026.
 - Takase et al. GFlowNet Fine-tuning for Diverse Correct Solutions in Mathematical Reasoning Tasks. arXiv 2410.20147, 2024.
 - Tiapkin et al. Generative Flow Networks as Entropy-Regularized RL. AISTATS 2024. arXiv 2310.12934.
+- Wang et al. Self-Consistency Improves Chain of Thought Reasoning in Language Models. ICLR 2023. arXiv 2203.11171.
 - Yan et al. Learning to Reason under Off-Policy Guidance. arXiv 2504.14945, 2025.
 - Younsi et al. Accurate and Diverse LLM Mathematical Reasoning via Automated PRM-Guided GFlowNets. arXiv 2504.19981, 2025.
 - Yu et al. Flow of Reasoning: Training LLMs for Divergent Reasoning with Minimal Examples. ICML 2025. arXiv 2406.05673.

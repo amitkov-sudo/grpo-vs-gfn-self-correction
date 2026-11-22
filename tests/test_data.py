@@ -64,3 +64,25 @@ def test_sc_items_keep_only_mistakes_at_step_2():
     assert [it["id"] for it in items] == [1]
     assert items[0]["starts"] == {"wrong": "Step one is 2 + 2 = 4. Step two is 4 * 3 = 13.",
                                   "clean": "Step one is 2 + 2 = 4. Step two is 4 * 3 = 12."}
+
+
+def test_location_items_move_one_bump_through_steps_2_to_4_of_the_same_problem():
+    pd = pytest.importorskip("pandas")
+    long_answer = ("Tom has 3 boxes of 4 apples, so 3*4=<<3*4=12>>12 apples.\n"
+                   "He eats 2, so 12-2=<<12-2=10>>10 are left.\n"
+                   "He buys 5 more, so 10+5=<<10+5=15>>15.\n"
+                   "He gives 3 away, so 15-3=<<15-3=12>>12.\n"
+                   "He doubles them: 12*2=<<12*2=24>>24.\n#### 24")
+    short_answer = "She has 2*3=<<2*3=6>>6 pens.\nShe loses 1: 6-1=<<6-1=5>>5.\n#### 5"
+    df = pd.DataFrame({"question": ["Tom's apples?", "Her pens?", "Tom's apples again?"],
+                       "answer": [long_answer, short_answer, long_answer]})
+    items = D.location_items(df, 10, exclude_questions=["Tom's apples again?"])
+    assert len(items) == 1                                   # too short, or excluded
+    it = items[0]
+    assert it["gold"] == 24.0 and sorted(it["by_line"]) == [2, 3, 4]
+    three = it["by_line"][3]
+    assert three["clean"] == ("Tom has 3 boxes of 4 apples, so 3*4=12 apples. He eats 2, so 12-2=10 are left. "
+                              "He buys 5 more, so 10+5=15.")
+    assert three["wrong"] == three["clean"][:-3] + "16."     # only step 3 changes, its result raised by one
+    assert it["by_line"][2]["wrong"].endswith("12-2=11 are left.")
+    assert it["by_line"][4]["wrong"].endswith("15-3=13.")

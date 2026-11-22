@@ -39,6 +39,15 @@ def reward(text, gold):
     return 1.0 if is_correct(text, gold) else 0.0
 
 
+def poisoned_reward(text, gold, tol=1e-6):
+    """The poisoning test's flipped reward: 1 for a final answer that is a number but not the right one, else 0.
+
+    On a wrong start this pays the model for carrying the planted error to a wrong answer and nothing for fixing it.
+    """
+    pred = predicted_answer(text)
+    return 1.0 if pred is not None and abs(pred - gold) >= tol else 0.0
+
+
 def opens_with_doubt(continuation):
     return bool(DOUBT.search(continuation.lstrip()))
 
