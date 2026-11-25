@@ -22,7 +22,8 @@ In the paper's terms, the "Wait" answers take the place of its replay buffer see
 - **Stop probability.** q(stop | prefix) is the trained model's probability that an end token (`<|im_end|>` or `<|endoftext|>`) comes next. An answer cut off at 320 tokens stops by force, with log q(stop) = 0 at its last point, as in the official code.
 - **Behaviour policy.** Half of the model's own answers use temperature 1. The other half use one temperature per step, drawn from [0.7, 1.2]. The paper draws from [0.5, 2] for answers of at most 20 tokens; at 320 tokens, a temperature of 2 turns text into noise.
 - **No replay buffer.** The paper keys its buffer by question, and this pilot never repeats a question. The "Wait" answers take its role.
-- **Optimiser.** AdamW, learning rate 1e-4 with a 20-step linear warm-up as in the official code, gradient clipping at 1.0.
+- **Optimiser.** AdamW, learning rate 1e-4 with a 20-step linear warm-up as in the official code. Gradients are clipped at norm 1.0, as in the 25 Nov runs; the official code does not clip.
+- **Worked examples in the reward (off by default).** `--reward-shots K` puts K worked GSM8K training solutions, each ending in "The answer is N.", before the question in the reward model's prompt, as the paper does with 3. The trained model never sees them. `tests/test_train.py` checks that they change only the reward's prompt.
 - **Correctness check in the tests.** `tests/test_train.py` compares the batched, padded step with a computation one answer at a time from full log-softmax tables, for micro-batches of 1, 2 and 3. The losses and the gradients agree.
 
 ## Settings against the paper
@@ -32,19 +33,21 @@ In the paper's terms, the "Wait" answers take the place of its replay buffer see
 | Model | Qwen3-1.7B, bfloat16 | instruction-tuned GPT-J 6B | fits a T4; same model as the 25 Nov runs |
 | Loss | modified sub-trajectory balance, λ = 1 | the same | |
 | Stopping points | line and sentence ends, at most 6 | every token | answers up to 320 tokens |
-| Reward | log p_ref(Z, Y \| X) | log p_LM(XZY), with 3 worked examples in the reward prompt | no examples yet; see the reward check |
+| Reward | log p_ref(Z, Y \| X) | log p_LM(XZY) | |
+| Worked examples in the reward prompt | none in the pilot; `REWARD_SHOTS=3` adds 3 (`--reward-shots`) | 3 | switch on if the reward check is weak |
 | Reward temperature | 1.1 to 0.5 over 60 steps | 1.1 to 0.5 over 150 steps | scaled to an 80-step run |
 | Behaviour policy | temperature 1, a drawn temperature in [0.7, 1.2], "Wait" answers | temperature 1, a drawn temperature in [0.5, 2], replay buffer | answer length; questions never repeat |
 | Replay buffer | none | 50 answers per question, seeded with dataset rationales | questions never repeat |
 | Answers per step | 8 problems × 8 answers | 32 questions × 16 answers | T4 time |
 | Steps | 80, fewer if the session runs out | 1,000 | one 12-hour Kaggle session |
 | Learning rate | 1e-4, 20-step warm-up | 1e-4, 20-step warm-up | |
+| Gradient clipping | at norm 1.0 | none in the official code | kept equal to T4 for the comparison |
 | LoRA | rank 32, alpha 64, dropout 0 | rank 64, alpha 16, dropout 0.1 | kept equal to T4 for the comparison |
 | Answer length | up to 320 tokens | 15 to 21 tokens | the task |
 
 ## Reward check
 
-The paper found the base model a poor judge on arithmetic: wrong rationales sometimes got high rewards, so the authors added 3 worked examples to the reward prompt. The summary's "Reward check" table gives the share of (right, wrong) answer pairs in each training batch where the untuned model gives the right answer the higher p(Y | X Z). Read it first. Around 50% means the reward cannot tell right from wrong, and the run should stop until examples go into the reward prompt.
+The paper found the base model a poor judge on arithmetic: wrong rationales sometimes got high rewards, so the authors added 3 worked examples to the reward prompt. The summary's "Reward check" table gives the share of (right, wrong) answer pairs in each training batch where the untuned model gives the right answer the higher p(Y | X Z). Read it first. Around 50% means the reward cannot tell right from wrong; the full run then needs `REWARD_SHOTS=3`, the paper's worked examples in the reward prompt (see "After the Kaggle pilot").
 
 ## Running it
 
@@ -58,6 +61,30 @@ Each step scores the right answer after every stopping point, so a step takes lo
 - The reward check.
 - Answer length over training. RapTB (Wang et al., ICML 2026) reports length drift when sub-trajectory balance fine-tunes language models.
 - Step time, and any run that stopped early.
+
+## After the Kaggle pilot: starting the full run yourself
+
+The pilot decides two settings for the full run, `REWARD_SHOTS` and `STEPS`. Everything else is ready in the repository.
+
+1. **Get the numbers.** Download `bundles/prelim-subtb-*.tar.gz` from the Kaggle version's Output tab, or read the summary at the end of the notebook's output.
+2. **Reward check.** Under "Reward check", read "p(Y) ranks right first, all" for the two SubTB runs.
+   - 65% or more: the reward tells right answers from wrong ones. Keep `REWARD_SHOTS=0`.
+   - Below 65%, or no number: the untuned model is a weak judge. Use `REWARD_SHOTS=3`, the paper's fix.
+3. **Time and cost.** Under "Progress", read the mean step time of the two SubTB runs on the T4, in seconds; call it S. With `STEPS` steps per run, the full queue takes about:
+   - on an L4: (S + 134) × STEPS / 3600 + 6 hours;
+   - on an L40S: (S / 2 + 67) × STEPS / 3600 + 3 hours.
+   Multiply by the hourly price: $0.80 for an EC2 L4, about $1.10 for a SageMaker AI L4, $1.86 for an L40S. If the cost passes about 80% of your credit, lower `STEPS`, for example to 200. Example: S = 360 seconds on an L4 with 300 steps gives about 47 hours, so about $38 on EC2 or $52 on SageMaker AI.
+4. **Check the quota.** Service Quotas must show the GPU quota approved before the machine starts.
+5. **Start the queue** on the machine, set up as in the runbook's "On AWS" section (EC2 or SageMaker AI), with the settings from steps 2 and 3:
+
+```bash
+REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh start
+```
+
+   Put the same settings in front of `status` and `bundle`, for example `REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh status`.
+6. **Watch and finish.** `status` prints the time left once the first steps finish. Download the newest bundle after each run, and stop the machine when the queue ends.
+
+Whatever the pilot's fix rates, the full run is the real test: four times the steps, and the paper's reward-temperature horizon. The pilot only sets `REWARD_SHOTS` and `STEPS`.
 
 ## The full run on AWS or the A100
 

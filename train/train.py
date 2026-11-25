@@ -106,6 +106,10 @@ def parse_args(argv=None):
     p.add_argument("--subtb-max-states", type=int, default=6,
                    help="subtb: stopping points per answer, counting the empty continuation and the end")
     p.add_argument("--subtb-lambda", type=float, default=1.0, help="subtb: weight lambda ** (gap - 1) per pair")
+    p.add_argument("--reward-shots", type=int, default=0,
+                   help="subtb: put this many worked GSM8K training solutions before the question in the reward "
+                        "model's prompt, as the paper does with 3, to make the untuned model a better judge; the "
+                        "trained model never sees them")
     p.add_argument("--warmup-steps", type=int, default=0, help="linear learning-rate warm-up over this many steps")
     p.add_argument("--max-hours", type=float, default=0.0,
                    help="stop training early when one more step, its evaluation and the final evaluation would pass "
@@ -138,6 +142,8 @@ def parse_args(argv=None):
             p.error("temperatures must be above 0, with --pf-temp-low at most --pf-temp-high")
         if "{}" not in a.answer_template:
             p.error("--answer-template needs {} where the right answer goes")
+    if a.reward_shots < 0 or (a.reward_shots and a.method != "subtb"):
+        p.error("--reward-shots must be 0 or more, and is only for --method subtb")
     if a.poison and (a.task != "fix" or not 0 < a.poison <= 1):
         p.error("--poison needs --task fix and a share above 0 and at most 1")
     if a.attack:
@@ -459,33 +465,72 @@ def token_terms(model, seqs, starts, pad_id, device, stop_ids=None):
     return tok_out, stop_out
 
 
+def reward_demos(k):
+    """k worked GSM8K training solutions for the reward prompt: the last k problems of the train split with 2 to 4
+    steps, as (question, visible solution lines, right answer)."""
+    df = data.load_gsm8k("train")
+    out = []
+    for r in df.iloc[::-1].itertuples():
+        lines = [data.visible(line) for line in data.raw_lines(r.answer)]
+        if 2 <= len(lines) <= 4:
+            out.append((r.question, lines, data.gold_answer(r.answer)))
+        if len(out) == k:
+            break
+    return out[::-1]
+
+
+def reward_prompt(tok, a, item):
+    """Token ids of X as the reward model reads it: the worked examples as earlier chat turns, then the question
+    and the written start. Without --reward-shots this is the trained model's own prompt."""
+    demos = getattr(a, "_reward_demos", None)
+    if demos is None:
+        demos = a._reward_demos = reward_demos(a.reward_shots)
+    msgs = []
+    for question, lines, gold in demos:
+        msgs += [{"role": "user", "content": question},
+                 {"role": "assistant", "content": ". ".join(lines) + "." + a.answer_template.format(fmt_number(gold))}]
+    msgs.append({"role": "user", "content": item["question"]})
+    head = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False)
+    return encode(tok, head + item["start"])
+
+
 @torch.no_grad()
 def subtb_prepare(model, tok, jobs, a, eos_ids, device, pad_id):
     """Stopping points and untempered log rewards of every answer, scored by the untuned model (adapter off).
 
     log R(prefix) = log p_ref(prefix | X) + log p_ref(Y | X, prefix), with Y the right answer in --answer-template,
     summed in log space as the paper does (p_LM(XZY), Hu et al. 2024, Eq. 2). The end token itself is not scored.
+    With --reward-shots, X for the reward model also holds worked examples (reward_prompt).
     """
     model.eval()
     score_mb = max(1, 4 * a.micro_batch)
+    shots = getattr(a, "reward_shots", 0)
+    prompts = {}
     for j in jobs:
         g = j["seq"][j["start"]:]
         j["terminated"] = bool(g) and g[-1] in eos_ids
         j["t_end"] = len(g) - 1 if j["terminated"] else len(g)
         j["states"] = stop_points([tok.decode([t]) for t in g[:j["t_end"]]], j["t_end"], a.subtb_max_states)
         j["y"] = encode(tok, a.answer_template.format(fmt_number(j["item"]["gold"])))
+        if shots:
+            key = (j["item"]["question"], j["item"]["start"])
+            if key not in prompts:
+                prompts[key] = reward_prompt(tok, a, j["item"])
+            j["ref_prompt"] = prompts[key]
+        else:
+            j["ref_prompt"] = j["seq"][:j["start"]]
     with model.disable_adapter():
         for i in range(0, len(jobs), score_mb):
             chunk = jobs[i:i + score_mb]
-            lps, _ = token_terms(model, [j["seq"][:j["start"] + j["t_end"]] for j in chunk],
-                                 [j["start"] for j in chunk], pad_id, device)
+            lps, _ = token_terms(model, [j["ref_prompt"] + j["seq"][j["start"]:j["start"] + j["t_end"]] for j in chunk],
+                                 [len(j["ref_prompt"]) for j in chunk], pad_id, device)
             for j, lp in zip(chunk, lps):
                 j["ref_tok"] = lp.double().cpu()
         pairs = [(j, p) for j in jobs for p in j["states"]]
         for i in range(0, len(pairs), score_mb):
             chunk = pairs[i:i + score_mb]
-            ys = answer_logprobs(model, [j["seq"][:j["start"] + p] + j["y"] for j, p in chunk],
-                                 [j["start"] + p for j, p in chunk], pad_id, device)
+            ys = answer_logprobs(model, [j["ref_prompt"] + j["seq"][j["start"]:j["start"] + p] + j["y"] for j, p in chunk],
+                                 [len(j["ref_prompt"]) + p for j, p in chunk], pad_id, device)
             for (j, p), v in zip(chunk, ys.tolist()):
                 j.setdefault("log_py", {})[p] = v
     for j in jobs:
@@ -512,6 +557,9 @@ def train_step_subtb(model, opt, params, jobs, a, device, pad_id, eos_ids=(), to
     model.train()
     opt.zero_grad(set_to_none=True)
     loss_value, pol_sums = 0.0, []
+    if weight_sum == 0:                      # every answer ended at once: no pair of stopping points, no update
+        return {"loss": 0.0, "grad_norm": 0.0, "log_ratio": 0.0, "reward_temp": round(temp_r, 4),
+                "pf_temp": a.pf_temp, "states": 1.0, "skipped": True}
     for i in range(0, len(jobs), a.micro_batch):
         chunk = jobs[i:i + a.micro_batch]
         tok_lp, stop_lp = token_terms(model, [j["seq"][:j["start"] + j["t_end"]] for j in chunk],

@@ -25,6 +25,7 @@
 #   QUEUE_SET=phase1  SEEDS="0 1"  MODEL=Qwen/Qwen3-1.7B  STEPS=60  EVAL_EVERY=20  EVAL_SAMPLES=8  LOCATION_N=50
 #   GEN_BATCH=64  MICRO_BATCH=4  PROMPTS=16  PYTHON=python3
 #   (subtb: SEEDS="0"  STEPS=300  EVAL_EVERY=50  PROMPTS=8)
+#   REWARD_SHOTS=0  subtb only: worked examples in the reward prompt, as the paper's 3 (docs/subtb-pilot.md)
 #   TOKENIZER=   only for an offline check whose cached tokenizer lacks a chat template
 #   SMOKE=1      the whole queue with the tiny random model on the CPU, two steps per run: a code check
 set -euo pipefail
@@ -42,6 +43,9 @@ LOCATION_N=${LOCATION_N:-50}
 GEN_BATCH=${GEN_BATCH:-64}
 MICRO_BATCH=${MICRO_BATCH:-4}
 QUEUE_SET=${QUEUE_SET:-phase1}
+REWARD_SHOTS=${REWARD_SHOTS:-0}
+SHOTS_TAG=""
+if [ "$REWARD_SHOTS" != 0 ]; then SHOTS_TAG="-shots$REWARD_SHOTS"; fi
 SMOKE=${SMOKE:-}
 TOKENIZER=${TOKENIZER:-}
 
@@ -58,9 +62,10 @@ case "$QUEUE_SET" in
                "TB-a5:--method tb --attack 0.05" "T2-a5:--method grpo --attack 0.05")
         EXTRA=() ;;
     subtb)
-        QUEUE=("SubTB-wait:--method subtb --nudge 0.5 --warmup-steps 20 --reward-temp-horizon 150"
+        SUBTB="--method subtb --warmup-steps 20 --reward-temp-horizon 150 --reward-shots $REWARD_SHOTS"
+        QUEUE=("SubTB-wait$SHOTS_TAG:$SUBTB --nudge 0.5"
                "T4:--method grpo --nudge 0.5"
-               "SubTB-own:--method subtb --warmup-steps 20 --reward-temp-horizon 150")
+               "SubTB-own$SHOTS_TAG:$SUBTB")
         EXTRA=(--location-n "$LOCATION_N")
         SEEDS=${SEEDS:-0}; STEPS=${STEPS:-300}; EVAL_EVERY=${EVAL_EVERY:-50}; PROMPTS=${PROMPTS:-8} ;;
     *)
@@ -103,9 +108,10 @@ setup() {
     if [ -n "$SMOKE" ]; then return; fi
     if ! "$PY" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
         echo "PyTorch with CUDA not found; installing it"
-        "$PY" -m pip install -q torch || "$PY" -m pip install -q --user torch
+        "$PY" -m pip install -q --no-cache-dir torch || "$PY" -m pip install -q --no-cache-dir --user torch
     fi
-    "$PY" -m pip install -q -r requirements.txt || "$PY" -m pip install -q --user -r requirements.txt
+    "$PY" -m pip install -q --no-cache-dir -r requirements.txt \
+        || "$PY" -m pip install -q --no-cache-dir --user -r requirements.txt
     # PEFT refuses to add LoRA layers next to a torchao older than 0.16; this repository does not use torchao.
     if "$PY" - <<'EOF'
 import importlib.metadata as m, sys

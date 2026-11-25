@@ -338,6 +338,10 @@ class _TinyTok:
     def decode(self, ids, skip_special_tokens=True):
         return "".join(ALPHABET[i] if i < len(ALPHABET) else "" for i in ids)
 
+    def apply_chat_template(self, msgs, add_generation_prompt, tokenize, enable_thinking):
+        text = "".join(("?" if m["role"] == "user" else "A") + m["content"] + "\n" for m in msgs)
+        return text + ("A" if add_generation_prompt else "")
+
 
 def enc(text):
     return _TinyTok()(text)["input_ids"]
@@ -458,3 +462,60 @@ def test_subtb_options_are_checked_and_named():
                 ["--task", "fix", "--method", "subtb", "--answer-template", "The answer"]):
         with pytest.raises(SystemExit):
             T.parse_args(bad)
+
+
+def direct_log_r(model, ref_prompt, answer, states, y):
+    """log p_ref(first p answer tokens | prompt) + log p_ref(Y | prompt, prefix), one prefix at a time."""
+    def table(ids):
+        return torch.log_softmax(model(input_ids=torch.tensor([ids])).logits[0].double(), -1)
+    full = ref_prompt + answer
+    out = []
+    with torch.no_grad(), model.disable_adapter():
+        lp = table(full)
+        for p in states:
+            seq = ref_prompt + answer[:p] + y
+            t2 = table(seq)
+            log_py = sum(t2[pos - 1, seq[pos]] for pos in range(len(ref_prompt) + p, len(seq)))
+            log_ans = sum(lp[pos - 1, full[pos]] for pos in range(len(ref_prompt), len(ref_prompt) + p))
+            out.append(float(log_ans + log_py))
+    return out
+
+
+@pytest.mark.parametrize("shots", [0, 1])
+def test_reward_shots_change_only_the_reward_prompt(model, monkeypatch, shots):
+    monkeypatch.setattr(T, "reward_demos", lambda k: [("1=1", ["1=1", "2=2"], 2.0)][:k])
+    tok = _TinyTok()
+    a = subtb_args(2)
+    a.reward_shots = shots
+    jobs = subtb_jobs()
+    for j in jobs:
+        j["item"].update({"question": "Q", "start": "="})
+    T.subtb_prepare(model, tok, jobs, a, [STOP_ID], CPU, pad_id=0)
+    demo = enc(tok.apply_chat_template([{"role": "user", "content": "1=1"},
+                                        {"role": "assistant", "content": "1=1. 2=2. The answer is 2."},
+                                        {"role": "user", "content": "Q"}], True, False, False) + "=")
+    for j in jobs:
+        want_prompt = demo if shots else j["seq"][:j["start"]]
+        assert j["ref_prompt"] == want_prompt
+        want = direct_log_r(model, want_prompt, j["seq"][j["start"]:j["start"] + j["t_end"]], j["states"], j["y"])
+        assert j["log_r"] == pytest.approx(want, rel=1e-5, abs=1e-5)
+
+
+def test_reward_shots_need_subtb():
+    assert T.parse_args(["--task", "fix", "--method", "subtb", "--reward-shots", "3"]).reward_shots == 3
+    for bad in (["--task", "fix", "--method", "grpo", "--reward-shots", "3"],
+                ["--task", "fix", "--method", "subtb", "--reward-shots", "-1"]):
+        with pytest.raises(SystemExit):
+            T.parse_args(bad)
+
+
+def test_subtb_step_skips_an_update_when_no_answer_has_two_stopping_points(model):
+    a = subtb_args(2)
+    stop_only = {"seq": enc("Q=") + [STOP_ID], "start": 3, "item": {"gold": 1.0}, "true_reward": 0.0,
+                 "nudged": False, "attacker": False}
+    params = [p for p in model.parameters() if p.requires_grad]
+    before = [p.detach().clone() for p in params]
+    opt = torch.optim.SGD(params, lr=1.0)
+    stats = T.train_step_subtb(model, opt, params, [stop_only, dict(stop_only)], a, CPU, pad_id=0,
+                               eos_ids=[STOP_ID], tok=_TinyTok(), step=1)
+    assert stats["skipped"] and all(torch.equal(b, p) for b, p in zip(before, params))

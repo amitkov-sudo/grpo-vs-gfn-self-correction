@@ -20,6 +20,7 @@
 #   GEN_BATCH=64  MICRO_BATCH=2  SESSION_HOURS=11.5  PYTHON=python3
 #   SESSION_HOURS  hours this script may use. Kaggle stops a session at 12 hours, and setup counts against them
 #   TOKENIZER=     only for an offline check whose cached tokenizer lacks a chat template
+#   REWARD_SHOTS=0 subtb only: worked examples in the reward prompt, as the paper's 3 (docs/subtb-pilot.md)
 #   SMOKE=1        both runs with the tiny random model on the CPU, two steps each: a code check
 set -euo pipefail
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -39,12 +40,17 @@ GEN_BATCH=${GEN_BATCH:-64}
 MICRO_BATCH=${MICRO_BATCH:-2}
 SESSION_HOURS=${SESSION_HOURS:-11.5}
 SMOKE=${SMOKE:-}
+REWARD_SHOTS=${REWARD_SHOTS:-0}
 TOKENIZER=${TOKENIZER:-}
 
 case "$PAIR" in
     main) RUNS=("T5:--method tb --nudge 0.5" "T4:--method grpo --nudge 0.5") ;;
     own)  RUNS=("T3:--method grpo --anchor" "T2:--method grpo") ;;
-    subtb) RUNS=("SubTB-wait:--method subtb --nudge 0.5 --warmup-steps 20" "SubTB-own:--method subtb --warmup-steps 20") ;;
+    subtb)
+        TAG=""
+        if [ "$REWARD_SHOTS" != 0 ]; then TAG="-shots$REWARD_SHOTS"; fi
+        RUNS=("SubTB-wait$TAG:--method subtb --nudge 0.5 --warmup-steps 20 --reward-shots $REWARD_SHOTS"
+              "SubTB-own$TAG:--method subtb --warmup-steps 20 --reward-shots $REWARD_SHOTS") ;;
     *)    echo "PAIR must be main, own or subtb"; exit 1 ;;
 esac
 if [ -z "$STEPS" ]; then if [ "$PAIR" = subtb ]; then STEPS=80; else STEPS=60; fi; fi

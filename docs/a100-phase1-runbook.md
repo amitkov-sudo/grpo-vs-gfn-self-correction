@@ -99,7 +99,7 @@ The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same upd
 | 2 | `subtb-T4-s0` | GRPO with "Wait" answers at the same length, the comparison |
 | 3 | `subtb-SubTB-own-s0` | sub-trajectory balance on the model's own answers |
 
-Each run takes 300 steps of 8 problems, with seed 0. It evaluates every 50 steps with 8 sampled answers per problem, and runs the location test with 50 problems at the start and the end. The reward temperature moves from 1.1 to 0.5 over 150 steps, the paper's horizon. `STEPS`, `PROMPTS` and `SEEDS` change the size; for example, `SEEDS="0 1"` adds a second seed. `status` and `bundle` need the same `QUEUE_SET=subtb` in front.
+Each run takes 300 steps of 8 problems, with seed 0. It evaluates every 50 steps with 8 sampled answers per problem, and runs the location test with 50 problems at the start and the end. The reward temperature moves from 1.1 to 0.5 over 150 steps, the paper's horizon. `STEPS`, `PROMPTS` and `SEEDS` change the size; for example, `SEEDS="0 1"` adds a second seed. `REWARD_SHOTS=3` adds the paper's worked examples to the reward prompt. `status` and `bundle` need the same settings in front. "After the Kaggle pilot" in `docs/subtb-pilot.md` says how to choose `REWARD_SHOTS` and `STEPS` from the pilot's results.
 
 **Time and cost.** Nobody has timed these runs on an L4 or an L40S yet. These estimates start from the Kaggle T4, which took 4.3 minutes per GRPO step (measured) and should take about 6 minutes per sub-trajectory balance step (estimated). They assume an L4 runs about twice as fast as a T4 and an L40S about four times as fast. Evaluations add about 6 hours on an L4.
 
