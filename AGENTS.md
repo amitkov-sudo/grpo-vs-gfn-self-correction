@@ -36,6 +36,8 @@ Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance 
 
 **Preliminary Phase 1 on Kaggle.** The same comparison in one free Kaggle session, while the A100 run waits: `scripts/kaggle_prelim.sh` and `notebooks/kaggle_prelim.ipynb` run T5 and T4 side by side on two T4s, then T3 and T2 in a second session. Each step uses 8 starts instead of 16, with one seed, 4 sampled answers per evaluation start and 20 location problems. `--max-hours` stops a run early enough to evaluate and save before Kaggle's 12-hour limit (`docs/kaggle-prelim.md`).
 
+Result, 25 Nov (`results/2026-11-25-kaggle-prelim.md`): T4 fixed 47/60 planted errors and raised 36/60 false alarms, while still answering 49/60 correct starts right. T5 at β = 4 barely moved: 2/60 fixed, no false alarms, drift 1.3 against 49 for T4. The anchor at β = 4 holds trajectory balance near the untuned model. T3 and T2 have not run.
+
 **Poisoning test.** The same script with `QUEUE_SET=poison` flips the reward on 25% or 10% of wrong starts, so a wrong answer earns 1 and a fix earns 0. It compares GRPO (T2) with trajectory balance on own attempts, with T3 as the check (`docs/poisoning-test.md`).
 
 **Attacker-replies test.** `QUEUE_SET=attack` gives attacked wrong-step problems 4 answers that continue after " That step is correct." and earn 1 for a wrong answer, as if an attacker had supplied them. It asks whether learning from answers the model did not write makes trajectory balance easier to poison than GRPO (`docs/attacker-replies-test.md`).

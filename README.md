@@ -4,6 +4,7 @@ GRPO against GFlowNet fine-tuning (trajectory balance) for self-correction. A la
 
 - Plan, conditions and conventions: [`AGENTS.md`](AGENTS.md)
 - Preliminary results of 14 Nov 2026: [`results/2026-11-14-wait-check.md`](results/2026-11-14-wait-check.md)
+- Kaggle preliminary of 25 Nov 2026, T5 against T4: [`results/2026-11-25-kaggle-prelim.md`](results/2026-11-25-kaggle-prelim.md)
 - Datasets for step-based tasks beyond maths: [`docs/datasets-beyond-math.md`](docs/datasets-beyond-math.md)
 - Recovery test beyond maths, on untuned models: [`docs/recovery-test-beyond-math.md`](docs/recovery-test-beyond-math.md)
 - Literature screening on recovery from a wrong step outside maths: [`docs/screening-recovery-beyond-math.md`](docs/screening-recovery-beyond-math.md)
@@ -72,6 +73,7 @@ data/cache/    ignored by git: downloaded GSM8K, GSM8K-SC, ProcBench and BIG-Ben
 - A third queue runs the attacker-replies test (`QUEUE_SET=attack`, `--attack`, `docs/attacker-replies-test.md`).
 - CPU smoke runs of all three queues complete. The trainer halves its batches when the GPU runs out of memory.
 - A preliminary Phase 1 fits one free Kaggle session (`scripts/kaggle_prelim.sh`, `notebooks/kaggle_prelim.ipynb`, `docs/kaggle-prelim.md`). It runs the same comparison with 8 starts per step and one seed, two runs side by side on Kaggle's two T4s. `--max-hours` makes each run evaluate and save before the 12-hour limit.
+- Kaggle preliminary, 25 Nov 2026 (`results/2026-11-25-kaggle-prelim.md`). GRPO with nudged answers (T4) fixed 47/60 planted errors but called 36/60 correct steps wrong. Trajectory balance at β = 4 (T5) stayed close to the untuned model, with 2/60 fixed and no false alarms. T3 and T2 have not run yet.
 - The recovery test beyond maths is built and passes its smoke run.
 - First GPU run, 14 to 15 Nov 2026 (`results/2026-11-15-sanity-check.md`): on a Kaggle T4, trajectory balance on the model's own answers made the same updates as GRPO with the drift penalty, step for step. Neither GRPO run raised GSM8K accuracy measurably in 60 steps. Each step took about 5 minutes in bfloat16.
 - Not built: T1 (supervised fine-tuning on nudged attempts that ended right) and a Tinker backend for Qwen3-8B.
