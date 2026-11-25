@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Queues for the program's A100 (40 GB): the fix task on Qwen3-1.7B.
+# Queues for one GPU machine, the program's A100 or an AWS instance: the fix task on Qwen3-1.7B.
 #
 #   bash scripts/a100_phase1.sh start            install, run the CPU checks, then start the queue in the background
 #   bash scripts/a100_phase1.sh status           progress, latest evaluations and time left
@@ -142,7 +142,7 @@ run_queue() {
             pack || echo "$(date '+%F %T') packing a bundle failed; the queue moves on"
         done
     done
-    echo "$(date '+%F %T') queue finished. Download the newest file in bundles/ before the grant ends."
+    echo "$(date '+%F %T') queue finished. Download the newest file in bundles/ before the grant ends or you terminate the machine."
 }
 
 running() {

@@ -1,6 +1,8 @@
-# Phase 1 on the program's A100
+# Running the queues on the program's A100 or on AWS
 
 Phase 1 is the fix task on Qwen3-1.7B. Each training start has two solution steps written into the answer, with step 2 either wrong or correct; the starts come from GSM8K train problems. Each run trains for 60 steps. It evaluates on the 60 GSM8K-SC test problems at steps 0, 20, 40 and 60.
+
+The steps below use the program's A100. The same script runs on an AWS GPU machine, and [On AWS](#on-aws) at the end covers the differences and the cost.
 
 | Order | Run | Condition | Flags |
 |---|---|---|---|
@@ -93,3 +95,84 @@ The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same upd
 - **A run fails:** the queue writes FAILED in `outputs/phase1-queue.log` and moves to the next run. Running `start` again later repeats only the unfinished runs.
 - **Stop everything:** `bash scripts/a100_phase1.sh stop`.
 - **Add a third seed:** `SEEDS="0 1 2" bash scripts/a100_phase1.sh start`.
+
+## On AWS
+
+The same script runs on an AWS GPU machine. The program's policy lists the AWS credit as the first paid GPU pool. A new AWS account gets $100 of credit at sign-up and up to $100 more for five onboarding tasks worth $20 each, as the program's "AWS Credit Program" doc explains.
+
+### Cost
+
+| Machine (us-east-1) | GPU | Price | Phase 1, 8 runs | All three queues, 24 runs |
+|---|---|---|---|---|
+| g6.xlarge | L4, 24 GB | $0.80/h | 15 to 48 h, $12 to $38 | 39 to 128 h, $31 to $103 |
+| g6e.xlarge | L40S, 48 GB | $1.86/h | 10 to 25 h, $19 to $46 | 26 to 66 h, $48 to $123 |
+
+- The hours multiply the A100 estimate in [Time](#time) by 1.5 to 2.5 for the L4 and by 1 to 1.3 for the L40S. Nobody has timed this code on either GPU, so check the time left in `status` after the first steps.
+- The prices are on-demand rates from the AWS price list of 14 Nov 2026. The disk ($0.08 per GB a month) and the public address ($0.005 an hour) add a little on top.
+- The g6.xlarge costs the least. The g6e.xlarge finishes sooner for a little more.
+- Avoid the T4 (g4dn). It has no bfloat16 hardware, and on Kaggle one step of the smaller Qwen3-0.6B took about 5 minutes.
+
+### 1. Account, credit and budget
+
+1. Sign up for a new AWS account with your personal email, and pick the free plan. The free plan never charges your card.
+2. Complete the five onboarding tasks AWS offers after sign-up. They raise the credit from $100 to $200.
+3. Open Budgets in Billing and Cost Management. Create a cost budget with the Customize option, set it to $150, and add email alerts at $50, $100 and $150. Under the advanced options, untick Credits. Otherwise the credit cancels out your usage, and no alert fires until the credit runs out. This budget also counts as one of the onboarding tasks.
+
+### 2. GPU quota
+
+A new account can't start a GPU machine until AWS raises a quota.
+
+1. Set the region at the top right of the console to US East (N. Virginia). Keep it there for every later step.
+2. Open Service Quotas, choose Amazon Elastic Compute Cloud (Amazon EC2), and find "Running On-Demand G and VT instances".
+3. Request 4. The quota counts vCPUs, and one g6.xlarge or g6e.xlarge uses 4.
+
+Approval can take minutes or a few days.
+
+### 3. Launch the machine
+
+In EC2, choose Launch instance and set:
+- **Image:** search for "Deep Learning OSS Nvidia Driver AMI GPU PyTorch" and pick the newest Ubuntu 24.04 version. It comes with the NVIDIA driver and PyTorch installed.
+- **Instance type:** g6.xlarge or g6e.xlarge.
+- **Key pair:** create a new one and keep the .pem file it downloads. On the Mac, run `chmod 400` on that file once, or SSH refuses it.
+- **Network settings:** allow SSH traffic from My IP.
+- **Storage:** keep the default size.
+
+If the launch fails with a message about the free plan, choose Upgrade plan in the console and launch again. The credit carries over, and your card pays only for use beyond it.
+
+### 4. Start the queue
+
+Connect from a terminal on the Mac. The instance's page shows its public IPv4 address.
+
+```bash
+ssh -i ~/Downloads/<key>.pem ubuntu@<public IPv4 address>
+```
+
+On the machine:
+
+```bash
+source /opt/pytorch/bin/activate
+git clone https://github.com/amitkov-sudo/grpo-vs-gfn-self-correction.git
+cd grpo-vs-gfn-self-correction
+bash scripts/a100_phase1.sh start
+```
+
+The first line switches to the image's PyTorch environment, so run it again after every login. The queue keeps running after you close the terminal. The commands in [The poisoning queue](#the-poisoning-queue), [The attacker queue](#the-attacker-queue) and [When something goes wrong](#when-something-goes-wrong) work here unchanged.
+
+### 5. Download the results
+
+From a terminal on the Mac:
+
+```bash
+scp -i ~/Downloads/<key>.pem "ubuntu@<public IPv4 address>:grpo-vs-gfn-self-correction/bundles/*.tar.gz" ~/Desktop/
+```
+
+### 6. Stop paying
+
+- **Stop** the instance (Instance state, then Stop instance) whenever no queue runs. A stopped machine costs only its disk, and it gets a new address when it starts again.
+- **Terminate** it once the bundles are on your Mac. That deletes the machine and its disk and ends all charges.
+
+### When something goes wrong on AWS
+
+- **"You have requested more vCPU capacity than your current vCPU limit":** the quota increase has not come through yet.
+- **"Insufficient capacity":** AWS has no free GPU of that type in that zone. Choose another subnet under Network settings, try the other machine type, or try again later.
+- **SSH times out after you switch networks:** your address changed. Set the security group's SSH rule to My IP again.
