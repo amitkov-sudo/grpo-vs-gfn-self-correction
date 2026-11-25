@@ -13,6 +13,7 @@ GRPO against GFlowNet fine-tuning (trajectory balance) for self-correction. A la
 - Poisoning test, a flipped reward on some wrong starts: [`docs/poisoning-test.md`](docs/poisoning-test.md)
 - Attacker-replies test, poisoned answers the model did not write: [`docs/attacker-replies-test.md`](docs/attacker-replies-test.md)
 - Preliminary Phase 1 in one free Kaggle session: [`docs/kaggle-prelim.md`](docs/kaggle-prelim.md)
+- Sub-trajectory balance pilot, the PI's next step: [`docs/subtb-pilot.md`](docs/subtb-pilot.md)
 
 ## Quick start
 
@@ -65,7 +66,7 @@ data/cache/    ignored by git: downloaded GSM8K, GSM8K-SC, ProcBench and BIG-Ben
 
 ## Status, 25 Nov 2026
 
-- Built and checked on the CPU: 67 offline tests pass (two of them need the cached ProcBench and BIG-Bench Mistake files), and the smoke run completes for GRPO, GRPO with the drift penalty, trajectory balance, and trajectory balance with nudged attempts.
+- Built and checked on the CPU: 81 offline tests pass (two of them need the cached ProcBench and BIG-Bench Mistake files), and the smoke run completes for GRPO, GRPO with the drift penalty, trajectory balance, and trajectory balance with nudged attempts.
 - Phase 1 is ready for the program's A100 or an Azure or AWS GPU machine (`scripts/a100_phase1.sh`, `docs/a100-phase1-runbook.md`). The queue holds T5, T4, T3 and T2 on Qwen3-1.7B with seeds 0 and 1.
   - Every evaluation adds 8 sampled answers per start, for pass@8 and a majority vote (`--eval-samples`).
   - Step 0 and the last step add the location test: matched GSM8K test problems with the error at step 2, 3 or 4 (`--location-n`).
@@ -74,6 +75,7 @@ data/cache/    ignored by git: downloaded GSM8K, GSM8K-SC, ProcBench and BIG-Ben
 - CPU smoke runs of all three queues complete. The trainer halves its batches when the GPU runs out of memory.
 - A preliminary Phase 1 fits one free Kaggle session (`scripts/kaggle_prelim.sh`, `notebooks/kaggle_prelim.ipynb`, `docs/kaggle-prelim.md`). It runs the same comparison with 8 starts per step and one seed, two runs side by side on Kaggle's two T4s. `--max-hours` makes each run evaluate and save before the 12-hour limit.
 - Kaggle preliminary, 25 Nov 2026 (`results/2026-11-25-kaggle-prelim.md`). GRPO with nudged answers (T4) fixed 47/60 planted errors but called 36/60 correct steps wrong. Trajectory balance at β = 4 (T5) stayed close to the untuned model, with 2/60 fixed and no false alarms. T3 and T2 have not run yet.
+- The PI's next step is built (`--method subtb`, `PAIR=subtb`, `docs/subtb-pilot.md`): sub-trajectory balance with the log reward log p_ref(Z | X) + log p_ref(Y | X Z) of Hu et al. (ICLR 2024), ported from the official code and checked against it in the tests. Not run on a GPU yet.
 - The recovery test beyond maths is built and passes its smoke run.
 - First GPU run, 14 to 15 Nov 2026 (`results/2026-11-15-sanity-check.md`): on a Kaggle T4, trajectory balance on the model's own answers made the same updates as GRPO with the drift penalty, step for step. Neither GRPO run raised GSM8K accuracy measurably in 60 steps. Each step took about 5 minutes in bfloat16.
 - Not built: T1 (supervised fine-tuning on nudged attempts that ended right) and a Tinker backend for Qwen3-8B.

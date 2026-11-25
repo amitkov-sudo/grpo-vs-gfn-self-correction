@@ -91,3 +91,23 @@ def test_a_run_stopped_by_its_time_limit(tmp_path, capsys):
     assert "| prelim-T5-s0 | T5 | 41/60 | 20.50 |  | 100 s | stopped after step 41 (time limit) |" in text
     assert "Hit the time limit and stopped early: prelim-T5-s0." in text
     assert "| prelim-T5-s0 | T5 | 41 | 8/60 | 2/60 | 55/60 |" in text
+
+
+def test_reward_check_table_for_subtb_runs(tmp_path, capsys):
+    out = str(tmp_path)
+    make_run(out, "prelim-SubTB-wait-s0", "SubTB, Wait answers", 0, [fix_eval(0, 1, 0)], done=False)
+    with open(os.path.join(out, "prelim-SubTB-wait-s0", "log.jsonl"), "a") as f:
+        for s, (auc_y, auc_r) in enumerate([(0.9, 0.6), (0.7, 0.4), (None, None)], start=1):
+            f.write(json.dumps({"step": s, "log_ratio": 0.0, "t_step": 300.0, "logpY_auc": auc_y,
+                                "logR_auc": auc_r}) + "\n")
+    S.main(["--out", out, "--prefix", "prelim-"])
+    text = capsys.readouterr().out
+    assert "## Reward check" in text
+    assert "| prelim-SubTB-wait-s0 | SubTB, Wait answers | 2 | 80.0% | 80.0% | 50.0% |" in text
+
+
+def test_no_reward_check_section_without_subtb_runs(tmp_path, capsys):
+    out = str(tmp_path)
+    make_run(out, "phase1-T5-s0", "T5", 2, [fix_eval(0, 1, 0)], done=False)
+    S.main(["--out", out, "--prefix", "phase1-"])
+    assert "## Reward check" not in capsys.readouterr().out

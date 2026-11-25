@@ -18,6 +18,13 @@ Tasks
   --max-hours H  stop training early when the next step and the final evaluation would pass H hours; the run
                  then evaluates and saves at the step it reached (Kaggle ends a session after 12 hours)
 
+Sub-trajectory balance (--method subtb), after Hu et al., ICLR 2024 (docs/subtb-pilot.md)
+  The log reward of stopping after a prefix Z is log p_ref(Z | X) + log p_ref(Y | X Z), with Y the right answer
+  in --answer-template and p_ref the untuned model, divided by a reward temperature that moves from
+  --reward-temp-start to --reward-temp-end. The loss is the paper's modified sub-trajectory balance, with
+  stopping points at the line and sentence ends of each answer. Half of the model's own answers are sampled at a
+  temperature drawn from [--pf-temp-low, --pf-temp-high], as the paper's tempered behaviour policy.
+
 Conditions (combined plan, section 4)
   T2  --method grpo                    GRPO as usually run, on the model's own attempts
   T3  --method grpo --anchor           drift penalty 1/beta to the untuned model, matched to T5
@@ -57,7 +64,7 @@ OOM = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)   # another team may
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="GRPO against trajectory balance on GSM8K, with LoRA.")
     p.add_argument("--task", choices=["gsm8k", "fix"], default="gsm8k")
-    p.add_argument("--method", choices=["grpo", "tb"], default="grpo")
+    p.add_argument("--method", choices=["grpo", "tb", "subtb"], default="grpo")
     p.add_argument("--anchor", action="store_true", help="GRPO: drift penalty 1/beta to the untuned model (T3)")
     p.add_argument("--nudge", type=float, default=0.0, help="fix task: share of each group that continues after ' Wait'")
     p.add_argument("--beta", type=float, default=4.0, help="target pi_ref * exp(beta * reward)")
@@ -89,6 +96,17 @@ def parse_args(argv=None):
                         "which continue after --attack-phrase and earn 1 for a wrong final answer")
     p.add_argument("--attack-replies", type=int, default=4, help="attacker answers in each attacked group")
     p.add_argument("--attack-phrase", default=data.ATTACK, help="the attacker's forced phrase after the written step")
+    p.add_argument("--answer-template", default=" The answer is {}.",
+                   help="subtb: the text Y, with the right answer filled in, scored after each prefix")
+    p.add_argument("--reward-temp-start", type=float, default=1.1, help="subtb: reward temperature at step 1")
+    p.add_argument("--reward-temp-end", type=float, default=0.5, help="subtb: reward temperature after the horizon")
+    p.add_argument("--reward-temp-horizon", type=int, default=60, help="subtb: steps from the start to the end value")
+    p.add_argument("--pf-temp-low", type=float, default=0.7, help="subtb: lowest temperature of the tempered answers")
+    p.add_argument("--pf-temp-high", type=float, default=1.2, help="subtb: highest temperature of the tempered answers")
+    p.add_argument("--subtb-max-states", type=int, default=6,
+                   help="subtb: stopping points per answer, counting the empty continuation and the end")
+    p.add_argument("--subtb-lambda", type=float, default=1.0, help="subtb: weight lambda ** (gap - 1) per pair")
+    p.add_argument("--warmup-steps", type=int, default=0, help="linear learning-rate warm-up over this many steps")
     p.add_argument("--max-hours", type=float, default=0.0,
                    help="stop training early when one more step, its evaluation and the final evaluation would pass "
                         "this many hours since the start; the run then evaluates and saves at the step it reached. "
@@ -109,6 +127,17 @@ def parse_args(argv=None):
         p.error("--location-n needs --task fix")
     if a.max_hours < 0:
         p.error("--max-hours must be 0 (no limit) or more")
+    if a.method == "subtb":
+        if a.anchor:
+            p.error("--anchor is for GRPO; sub-trajectory balance has the untuned model in its reward already")
+        if a.poison or a.attack:
+            p.error("--poison and --attack are not built for --method subtb: its reward comes from the right answer")
+        if a.subtb_max_states < 2:
+            p.error("--subtb-max-states must count at least the empty continuation and the end")
+        if not 0 < a.pf_temp_low <= a.pf_temp_high or min(a.reward_temp_start, a.reward_temp_end) <= 0:
+            p.error("temperatures must be above 0, with --pf-temp-low at most --pf-temp-high")
+        if "{}" not in a.answer_template:
+            p.error("--answer-template needs {} where the right answer goes")
     if a.poison and (a.task != "fix" or not 0 < a.poison <= 1):
         p.error("--poison needs --task fix and a share above 0 and at most 1")
     if a.attack:
@@ -131,6 +160,8 @@ def parse_args(argv=None):
 
 
 def condition(a):
+    if a.method == "subtb":
+        return "SubTB, Wait answers" if a.nudge else "SubTB, own answers"
     if a.method == "tb":
         c = "T5" if a.nudge else "TB, own attempts"
     elif a.anchor:
@@ -265,14 +296,14 @@ def left_pad(seqs, pad_id, device):
 
 
 @torch.no_grad()
-def generate(model, tok, prompts, max_new, a, eos_ids, device, greedy=False):
+def generate(model, tok, prompts, max_new, a, eos_ids, device, greedy=False, temperature=None):
     """Continuations as token lists, each cut after its first end token.
 
     When the GPU runs out of memory, the batch halves for the rest of the run and the same prompts are tried again.
     """
     model.eval()
-    sampling = {"do_sample": False} if greedy else {"do_sample": True, "temperature": a.temperature,
-                                                    "top_p": 1.0, "top_k": 0}
+    temp = a.temperature if temperature is None else temperature
+    sampling = {"do_sample": False} if greedy else {"do_sample": True, "temperature": temp, "top_p": 1.0, "top_k": 0}
     outs, b = [], 0
     while b < len(prompts):
         chunk = prompts[b:b + a.gen_batch]
@@ -334,11 +365,25 @@ def sample_batch(model, tok, starts, a, eos_ids, device):
         forced = encode(tok, text + phrase) if n_forced else None
         if forced is not None and forced[:len(base)] != base:
             raise ValueError("the forced phrase changes the tokens before it; pick another phrase")
+        n_own = a.k - n_forced
         for j in range(a.k):
-            off = j >= a.k - n_forced
+            off = j >= n_own
             jobs.append({"group": g, "item": it, "nudged": off and not attacked, "attacker": off and attacked,
-                         "prompt": forced if off else base, "start": len(base)})
-    gens = generate(model, tok, [j["prompt"] for j in jobs], a.max_new_tokens, a, eos_ids, device)
+                         "prompt": forced if off else base, "start": len(base),
+                         "tempered": getattr(a, "method", "") == "subtb" and not off and j >= n_own // 2 + n_own % 2})
+    gens = [None] * len(jobs)
+    a.pf_temp = None
+    for tempered in (False, True):           # subtb: the tempered behaviour policy draws its temperature per step
+        idx = [n for n, j in enumerate(jobs) if j["tempered"] == tempered]
+        if not idx:
+            continue
+        temp = None
+        if tempered:
+            temp = a.pf_temp = random.uniform(a.pf_temp_low, a.pf_temp_high)
+        out = generate(model, tok, [jobs[n]["prompt"] for n in idx], a.max_new_tokens, a, eos_ids, device,
+                       temperature=temp)
+        for n, g_ in zip(idx, out):
+            gens[n] = g_
     for n, (j, g) in enumerate(zip(jobs, gens)):
         j["seq"] = j["prompt"] + g
         j["text"] = tok.decode(g, skip_special_tokens=True)
@@ -349,6 +394,160 @@ def sample_batch(model, tok, starts, a, eos_ids, device):
             j["reward"] = float(n % 2)
         j["truncated"] = len(g) >= a.max_new_tokens and g[-1] not in eos_ids
     return jobs
+
+
+# ------------------------------------------------------------------------------------------ sub-trajectory balance
+SENTENCE_END = (".", "!", "?")
+
+
+def stop_points(pieces, t_end, max_states):
+    """Stopping points of one answer, as prefix lengths: 0, the line and sentence ends before t_end, and t_end.
+
+    pieces[t] is the text of answer token t. A line ends after a token that holds a newline. A sentence ends after a
+    token ending in . ! or ?, when that token ends in white space or the next one starts with it, so "1.5" does not
+    count. With more ends than max_states - 2, evenly spaced ones are kept.
+    """
+    if t_end <= 0:
+        return [0]
+    ends = []
+    for t in range(t_end - 1):
+        piece, nxt = pieces[t], pieces[t + 1]
+        stripped = piece.rstrip()
+        if "\n" in piece or (stripped.endswith(SENTENCE_END) and (stripped != piece or nxt[:1].isspace())):
+            ends.append(t + 1)
+    m = max_states - 2
+    if len(ends) > m:
+        ends = [] if m <= 0 else sorted({ends[round(i * (len(ends) - 1) / max(m - 1, 1))] for i in range(m)})
+    return [0] + ends + [t_end]
+
+
+def fmt_number(x):
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+def reward_temperature(a, step):
+    """The paper's linear schedule from --reward-temp-start to --reward-temp-end; step 1 is the first update."""
+    frac = min(1.0, (step - 1) / a.reward_temp_horizon) if a.reward_temp_horizon > 0 else 1.0
+    return a.reward_temp_start + (a.reward_temp_end - a.reward_temp_start) * max(frac, 0.0)
+
+
+def token_terms(model, seqs, starts, pad_id, device, stop_ids=None):
+    """Per-token log q of each sequence's answer tokens, and log q(stop | prefix) for every prefix length.
+
+    Returns two lists. tok[i] holds the log-probabilities of the tokens from position starts[i] on. With stop_ids,
+    stop[i][p] is the log-probability that the next token after the first p answer tokens is one of stop_ids,
+    for p = 0 .. len(answer).
+    """
+    n_ans = [len(s) - st for s, st in zip(seqs, starts)]
+    A = max(n_ans)
+    ids, att = left_pad(seqs, pad_id, device)
+    pos = (att.cumsum(-1) - 1).clamp(min=0)
+    try:
+        out = model(input_ids=ids, attention_mask=att, position_ids=pos, logits_to_keep=A + 1)
+    except TypeError:
+        out = model(input_ids=ids, attention_mask=att, position_ids=pos)
+    logits = out.logits[:, -(A + 1):].float()       # window position w predicts the token at w + 1
+    lse = torch.logsumexp(logits, dim=-1)
+    if A > 0:
+        tgt = ids[:, -A:]
+        tok = logits[:, :-1].gather(-1, tgt.unsqueeze(-1)).squeeze(-1) - lse[:, :-1]
+    else:
+        tok = logits.new_zeros(len(seqs), 0)
+    stop = torch.logsumexp(logits[:, :, list(stop_ids)], dim=-1) - lse if stop_ids else None
+    tok_out = [tok[i, A - m:] for i, m in enumerate(n_ans)]
+    stop_out = [stop[i, A - m:] for i, m in enumerate(n_ans)] if stop is not None else []
+    return tok_out, stop_out
+
+
+@torch.no_grad()
+def subtb_prepare(model, tok, jobs, a, eos_ids, device, pad_id):
+    """Stopping points and untempered log rewards of every answer, scored by the untuned model (adapter off).
+
+    log R(prefix) = log p_ref(prefix | X) + log p_ref(Y | X, prefix), with Y the right answer in --answer-template,
+    summed in log space as the paper does (p_LM(XZY), Hu et al. 2024, Eq. 2). The end token itself is not scored.
+    """
+    model.eval()
+    score_mb = max(1, 4 * a.micro_batch)
+    for j in jobs:
+        g = j["seq"][j["start"]:]
+        j["terminated"] = bool(g) and g[-1] in eos_ids
+        j["t_end"] = len(g) - 1 if j["terminated"] else len(g)
+        j["states"] = stop_points([tok.decode([t]) for t in g[:j["t_end"]]], j["t_end"], a.subtb_max_states)
+        j["y"] = encode(tok, a.answer_template.format(fmt_number(j["item"]["gold"])))
+    with model.disable_adapter():
+        for i in range(0, len(jobs), score_mb):
+            chunk = jobs[i:i + score_mb]
+            lps, _ = token_terms(model, [j["seq"][:j["start"] + j["t_end"]] for j in chunk],
+                                 [j["start"] for j in chunk], pad_id, device)
+            for j, lp in zip(chunk, lps):
+                j["ref_tok"] = lp.double().cpu()
+        pairs = [(j, p) for j in jobs for p in j["states"]]
+        for i in range(0, len(pairs), score_mb):
+            chunk = pairs[i:i + score_mb]
+            ys = answer_logprobs(model, [j["seq"][:j["start"] + p] + j["y"] for j, p in chunk],
+                                 [j["start"] + p for j, p in chunk], pad_id, device)
+            for (j, p), v in zip(chunk, ys.tolist()):
+                j.setdefault("log_py", {})[p] = v
+    for j in jobs:
+        cum = torch.cat([torch.zeros(1, dtype=torch.float64), j["ref_tok"].cumsum(0)])
+        j["log_r"] = [float(cum[p]) + j["log_py"][p] for p in j["states"]]
+
+
+def auc(pos, neg):
+    """Share of (pos, neg) pairs where the pos value is higher, ties counting half; None without both kinds."""
+    if not pos or not neg:
+        return None
+    return sum((p > q) + 0.5 * (p == q) for p in pos for q in neg) / (len(pos) * len(neg))
+
+
+def train_step_subtb(model, opt, params, jobs, a, device, pad_id, eos_ids=(), tok=None, step=1):
+    """One update with the paper's modified sub-trajectory balance over each answer's stopping points.
+
+    log F at a stopping point is its log reward divided by the reward temperature, minus log q(stop | prefix). A
+    cut-off answer stops by force, so its last point takes log q(stop) = 0, as in the official code.
+    """
+    temp_r = reward_temperature(a, step)
+    subtb_prepare(model, tok, jobs, a, eos_ids, device, pad_id)
+    weight_sum = losses.subtb_weight_sum([len(j["states"]) for j in jobs], a.subtb_lambda)
+    model.train()
+    opt.zero_grad(set_to_none=True)
+    loss_value, pol_sums = 0.0, []
+    for i in range(0, len(jobs), a.micro_batch):
+        chunk = jobs[i:i + a.micro_batch]
+        tok_lp, stop_lp = token_terms(model, [j["seq"][:j["start"] + j["t_end"]] for j in chunk],
+                                      [j["start"] for j in chunk], pad_id, device, stop_ids=eos_ids)
+        S = max(2, max(len(j["states"]) for j in chunk))
+        rows_f, rows_s = [], []
+        for c, j in enumerate(chunk):
+            states = j["states"]
+            cum = torch.cat([tok_lp[c].new_zeros(1), tok_lp[c].cumsum(0)])
+            stop = stop_lp[c][states]
+            if not j["terminated"]:
+                stop = torch.cat([stop[:-1], stop.new_zeros(1)])
+            f = torch.tensor(j["log_r"], device=device, dtype=cum.dtype) / temp_r - stop
+            s = cum[states[1:]] - cum[states[:-1]]
+            rows_f.append(torch.nn.functional.pad(f, (0, S - len(f))))
+            rows_s.append(torch.nn.functional.pad(s, (0, S - 1 - len(s))))
+        loss = losses.subtb_loss(torch.stack(rows_f), torch.stack(rows_s), [len(j["states"]) for j in chunk],
+                                 weight_sum, a.subtb_lambda)
+        loss.backward()
+        loss_value += float(loss.detach())
+        pol_sums += [float(t.detach().sum()) for t in tok_lp]
+    gnorm = float(torch.nn.utils.clip_grad_norm_(params, a.grad_clip))
+    opt.step()
+    ref_sums = [float(j["ref_tok"].sum()) for j in jobs]
+    right = [j for j in jobs if j["true_reward"] == 1.0]
+    wrong = [j for j in jobs if j["true_reward"] != 1.0]
+    stats = {"loss": loss_value, "grad_norm": gnorm,
+             "log_ratio": sum(p - r for p, r in zip(pol_sums, ref_sums)) / len(jobs),
+             "reward_temp": round(temp_r, 4), "pf_temp": a.pf_temp,
+             "states": sum(len(j["states"]) for j in jobs) / len(jobs),
+             "logR_right": sum(j["log_r"][-1] for j in right) / len(right) if right else None,
+             "logR_wrong": sum(j["log_r"][-1] for j in wrong) / len(wrong) if wrong else None,
+             "logR_auc": auc([j["log_r"][-1] for j in right], [j["log_r"][-1] for j in wrong]),
+             "logpY_auc": auc([j["log_py"][j["states"][-1]] for j in right],
+                              [j["log_py"][j["states"][-1]] for j in wrong])}
+    return stats
 
 
 def loss_fn(a, lp, ref, r):
@@ -383,15 +582,16 @@ def train_step(model, opt, params, jobs, a, device, pad_id):
     return {"loss": loss_value, "grad_norm": gnorm, "log_ratio": float((cur - ref).mean())}
 
 
-def train_step_fitting_memory(model, opt, params, jobs, a, device, pad_id):
-    """train_step, with micro-batches halved for the rest of the run each time the GPU runs out of memory.
+def train_step_fitting_memory(model, opt, params, jobs, a, device, pad_id, **kw):
+    """train_step (or train_step_subtb), with micro-batches halved each time the GPU runs out of memory.
 
     The error comes before the optimizer step, so the step runs again from the start. The micro-batch size does not
     change the gradient (tests/test_train.py).
     """
+    step_fn = train_step_subtb if getattr(a, "method", "") == "subtb" else train_step
     while True:
         try:
-            return train_step(model, opt, params, jobs, a, device, pad_id)
+            return step_fn(model, opt, params, jobs, a, device, pad_id, **kw)
         except OOM:
             if a.micro_batch == 1:
                 raise
@@ -632,11 +832,16 @@ def main(argv=None):
         if a.eval_every < 0:
             record({"eval": evaluate(model, tok, a, eos_ids, device, 0, out_dir, final=True)})
     else:
+        subtb_kw = {"eos_ids": eos_ids, "tok": tok} if a.method == "subtb" else {}
         for step in range(1, a.steps + 1):
+            if a.warmup_steps:                        # the official code warms up over 20 steps
+                for group in opt.param_groups:
+                    group["lr"] = a.lr * min(1.0, step / a.warmup_steps)
             t0 = time.time()
             jobs = sample_batch(model, tok, starts.next(a.prompts), a, eos_ids, device)
             t_gen = time.time() - t0
-            stats = train_step_fitting_memory(model, opt, params, jobs, a, device, tok.pad_token_id)
+            stats = train_step_fitting_memory(model, opt, params, jobs, a, device, tok.pad_token_id,
+                                              **({**subtb_kw, "step": step} if subtb_kw else {}))
             step_times.append(time.time() - t0)
             record({"step": step, **stats, **step_stats(jobs), "t_gen": round(t_gen, 1),
                     "t_step": round(step_times[-1], 1)})

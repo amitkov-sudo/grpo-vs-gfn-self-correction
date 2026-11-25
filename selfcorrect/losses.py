@@ -71,3 +71,39 @@ def tb_loss(seq_logp, ref_logp, reward, k, beta, n_tokens=None):
 def sft_loss(seq_logp, n_tokens):
     """Mean negative log-likelihood per token of the chosen answers."""
     return -(seq_logp / n_tokens).mean()
+
+
+def subtb_weight_sum(n_states, lam=1.0):
+    """Sum of lam ** (l - j - 1) over every pair of stopping points j < l of every answer."""
+    total = 0.0
+    for s in (int(x) for x in n_states):
+        total += sum(lam ** (gap - 1) * (s - gap) for gap in range(1, s))
+    return total
+
+
+def subtb_loss(log_f, seg_logpf, n_states, weight_sum=None, lam=1.0):
+    """Modified sub-trajectory balance (Hu et al., ICLR 2024, Eq. 3) over the stopping points of each answer.
+
+    log_f[i, k]      log F at answer i's k-th stopping point: its log reward (already divided by the reward
+                     temperature) minus log q(stop | prefix). Rows are padded with zeros after n_states[i] points.
+    seg_logpf[i, k]  sum of log q over the answer tokens between stopping points k and k + 1.
+    n_states[i]      the number of stopping points of answer i, at least 2: the empty continuation and the end.
+
+    For every pair of stopping points j < l, the residual is log F_j + (log q of the tokens from j to l) - log F_l.
+    The loss weights its square by lam ** (l - j - 1), sums over every pair of every answer and divides by the sum
+    of the weights, as the official code does (github.com/GFNOrg/gfn-lm-tuning, main.py, loss_type
+    'modified_subtb', which puts a stopping point after every token). With a stopping point after every token the
+    two agree exactly (tests/test_losses.py). weight_sum, from subtb_weight_sum over the whole batch, lets
+    micro-batches add up to the full-batch loss.
+    """
+    n, S = log_f.shape
+    delta = log_f[:, :-1] + seg_logpf - log_f[:, 1:]
+    c = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
+    resid = c[:, None, :] - c[:, :, None]                       # resid[i, j, l] = c[i, l] - c[i, j]
+    idx = torch.arange(S, device=log_f.device)
+    j, l = idx[:, None], idx[None, :]
+    n_states = torch.as_tensor(n_states, device=log_f.device)
+    valid = (l > j)[None] & (l[None] < n_states[:, None, None])
+    w = (lam ** (l - j - 1).clamp(min=0).to(log_f.dtype))[None] * valid
+    total = w.sum() if weight_sum is None else weight_sum
+    return (w * resid ** 2).sum() / total

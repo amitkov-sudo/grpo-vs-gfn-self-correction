@@ -28,6 +28,7 @@ A Kaggle session ends after 12 hours, and nobody has timed Qwen3-1.7B on a T4 ye
 4. Leave `PAIR = "main"` and choose **Save Version**, then **Save & Run All (Commit)**. The run continues after you close the browser.
 5. When the version finishes, open its Output tab and download `bundles/prelim-main-*.tar.gz`. It holds the summary, the logs and every evaluation.
 6. For the second session, set `PAIR = "own"` and commit again. That session runs T3 and T2.
+7. For the PI's next step, set `PAIR = "subtb"`: sub-trajectory balance with and without "Wait" answers, 80 steps (`docs/subtb-pilot.md`).
 
 Each session uses up to 12 of Kaggle's 30 free GPU hours a week, so both sessions fit in one week. The two runs of a session go side by side, one on each T4.
 

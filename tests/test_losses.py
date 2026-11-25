@@ -119,3 +119,70 @@ def test_target_fix_rate_at_beta_4_is_80_percent():
 def test_group_size_must_divide_the_batch():
     with pytest.raises(ValueError):
         L.advantages(torch.ones(7), 3)
+
+
+# ------------------------------------------------------------------------------------------ sub-trajectory balance
+def official_modified_subtb(logrewards, eos_logprob, logPF, lengths, lam):
+    """The loss of github.com/GFNOrg/gfn-lm-tuning (infill_subj_arithmetic/main.py, loss_type 'modified_subtb').
+
+    Rewritten without the tokenizer: logrewards and eos_logprob have max_len + 1 columns, logPF max_len columns,
+    and lengths[i] is the number of transitions of trajectory i that the official end-of-sequence mask keeps.
+    """
+    max_len = logPF.shape[1]
+    delta = logrewards[:, :-1] - eos_logprob[:, :-1] + logPF - (logrewards[:, 1:] - eos_logprob[:, 1:])
+    delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
+    mask = torch.arange(max_len)[None, :] >= torch.as_tensor(lengths)[:, None]
+    batch_loss, total_lambda = 0.0, 0.0
+    for subtraj_len in range(1, max_len + 1):
+        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
+        subtb_term[mask[:, subtraj_len - 1:]] = 0
+        batch_loss += lam ** (subtraj_len - 1) * subtb_term.sum()
+        total_lambda += lam ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1:]).sum()
+    return batch_loss / total_lambda
+
+
+@pytest.mark.parametrize("lam", [1.0, 0.9])
+def test_subtb_with_a_stop_after_every_token_matches_the_official_code(lam):
+    g = torch.Generator().manual_seed(1)
+    n, max_len = 4, 6
+    lengths = [6, 3, 5, 1]
+    logrewards = -5 * torch.rand(n, max_len + 1, generator=g, dtype=torch.float64)
+    eos_logprob = -3 * torch.rand(n, max_len + 1, generator=g, dtype=torch.float64)
+    logPF = -2 * torch.rand(n, max_len, generator=g, dtype=torch.float64)
+    want = official_modified_subtb(logrewards, eos_logprob, logPF, lengths, lam)
+    log_f = torch.zeros(n, max_len + 1, dtype=torch.float64)
+    seg = torch.zeros(n, max_len, dtype=torch.float64)
+    for i, m in enumerate(lengths):                      # a trajectory with m transitions has m + 1 stopping points
+        log_f[i, :m + 1] = logrewards[i, :m + 1] - eos_logprob[i, :m + 1]
+        seg[i, :m] = logPF[i, :m]
+    n_states = [m + 1 for m in lengths]
+    got = L.subtb_loss(log_f, seg, n_states, lam=lam)
+    assert torch.allclose(got, want, atol=1e-12)
+    assert math.isclose(L.subtb_weight_sum(n_states, lam), sum(
+        lam ** (gap - 1) * (s - gap) for s in n_states for gap in range(1, s)))
+
+
+def test_subtb_is_zero_when_every_segment_balances_its_flows():
+    log_f = torch.tensor([[-3.0, -7.5, -2.0, 0.0], [-1.0, -4.0, 0.0, 0.0]], dtype=torch.float64)
+    seg = log_f[:, 1:] - log_f[:, :-1]
+    assert float(L.subtb_loss(log_f, seg, [4, 2])) == 0.0
+
+
+def test_subtb_micro_batches_add_up_to_the_full_batch_loss():
+    g = torch.Generator().manual_seed(2)
+    log_f = -4 * torch.rand(5, 4, generator=g, dtype=torch.float64)
+    seg = -3 * torch.rand(5, 3, generator=g, dtype=torch.float64)
+    n_states = [4, 2, 3, 4, 2]
+    full = L.subtb_loss(log_f, seg, n_states)
+    ws = L.subtb_weight_sum(n_states)
+    parts = L.subtb_loss(log_f[:2], seg[:2], n_states[:2], ws) + L.subtb_loss(log_f[2:], seg[2:], n_states[2:], ws)
+    assert torch.allclose(full, parts, atol=1e-12)
+
+
+def test_subtb_ignores_padding_after_the_last_stopping_point():
+    log_f = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float64)
+    seg = torch.tensor([[-0.5, -0.25]], dtype=torch.float64)
+    short = L.subtb_loss(log_f[:, :2], seg[:, :1], [2])
+    padded = L.subtb_loss(torch.tensor([[-1.0, -2.0, 99.0]], dtype=torch.float64),
+                          torch.tensor([[-0.5, 42.0]], dtype=torch.float64), [2])
+    assert torch.allclose(short, padded)

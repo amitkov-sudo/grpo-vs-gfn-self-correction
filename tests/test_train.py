@@ -321,3 +321,140 @@ def test_max_hours_must_not_be_negative():
     assert T.parse_args(["--max-hours", "10.5"]).max_hours == 10.5
     with pytest.raises(SystemExit):
         T.parse_args(["--max-hours", "-1"])
+
+
+# ------------------------------------------------------------------------------------------ sub-trajectory balance
+ALPHABET = "0123456789 .\nWaitTheswrApl=?!-"           # 31 symbols, inside the tiny model's 40-token vocabulary
+STOP_ID = 39
+
+
+class _TinyTok:
+    """One token per character from ALPHABET; STOP_ID ends an answer."""
+    pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ALPHABET.index(c) if c in ALPHABET else 10 for c in text]}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(ALPHABET[i] if i < len(ALPHABET) else "" for i in ids)
+
+
+def enc(text):
+    return _TinyTok()(text)["input_ids"]
+
+
+def test_stop_points_take_line_and_sentence_ends_but_not_decimals():
+    pieces = list("12-2=11. Wait, 1.5 is\nfine. So")             # one character per token
+    t_end = len(pieces)
+    got = T.stop_points(pieces, t_end, max_states=10)
+    assert got[0] == 0 and got[-1] == t_end
+    ends = [p for p in got[1:-1]]
+    assert ends == [8, 22, 27]                                    # after "11.", after "is\n", after "fine."
+    assert T.stop_points(pieces, t_end, max_states=4) == [0, 8, 27, t_end]      # evenly spaced when capped
+    assert T.stop_points(pieces, t_end, max_states=3) == [0, 8, t_end]
+    assert T.stop_points(pieces, t_end, max_states=2) == [0, t_end]
+    assert T.stop_points([], 0, 6) == [0]
+
+
+def test_reward_temperature_moves_linearly_then_holds():
+    a = SimpleNamespace(reward_temp_start=1.1, reward_temp_end=0.5, reward_temp_horizon=60)
+    assert T.reward_temperature(a, 1) == pytest.approx(1.1)
+    assert T.reward_temperature(a, 31) == pytest.approx(0.8)
+    assert T.reward_temperature(a, 61) == pytest.approx(0.5)
+    assert T.reward_temperature(a, 80) == pytest.approx(0.5)
+
+
+def test_token_terms_match_one_sequence_at_a_time(model):
+    seqs = [[1, 2, 3, 4, 5, 6], [7, 8, 9], [10, 11, 12, 13, 14, 15, 16], [17, 18, 19, 20]]
+    starts = [2, 1, 4, 4]                                          # the last one has an empty answer
+    with torch.no_grad():
+        tok, stop = T.token_terms(model, seqs, starts, pad_id=0, device=CPU, stop_ids=[STOP_ID, 3])
+        for s, st, t, sp in zip(seqs, starts, tok, stop):
+            lp = torch.log_softmax(model(input_ids=torch.tensor([s])).logits[0].double(), -1)
+            want_tok = torch.stack([lp[pos - 1, s[pos]] for pos in range(st, len(s))]) if len(s) > st else lp.new_zeros(0)
+            want_stop = torch.stack([torch.logsumexp(lp[st + p - 1, [STOP_ID, 3]], 0) for p in range(len(s) - st + 1)])
+            assert torch.allclose(t.double(), want_tok, atol=1e-6)
+            assert torch.allclose(sp.double(), want_stop, atol=1e-6)
+
+
+def subtb_jobs():
+    question = "Q"
+    texts = ["11. So 11.", "Wait, 10. So 10.\n10", "10"]           # the last one is cut off (no stop token)
+    jobs = []
+    for n, text in enumerate(texts):
+        prompt = enc(question + "=")
+        answer = enc(text) + ([STOP_ID] if n < 2 else [])
+        jobs.append({"seq": prompt + answer, "start": len(prompt), "item": {"gold": 10.0},
+                     "true_reward": float(text.endswith("10")), "nudged": False, "attacker": False})
+    return jobs
+
+
+def subtb_args(micro_batch):
+    return SimpleNamespace(micro_batch=micro_batch, subtb_max_states=4, answer_template=" The answer is {}.",
+                           reward_temp_start=1.1, reward_temp_end=0.5, reward_temp_horizon=60, subtb_lambda=1.0,
+                           grad_clip=1e9, pf_temp=None, method="subtb")
+
+
+def direct_subtb_loss(model, jobs, a, temp):
+    """The same loss, one answer at a time with full log-softmax tables, as a check of the batched code."""
+    def table(ids):
+        return torch.log_softmax(model(input_ids=torch.tensor([ids])).logits[0].double(), -1)
+    rows_f, rows_s, n_states = [], [], []
+    S = max(len(j["states"]) for j in jobs)
+    for j in jobs:
+        st, te, states = j["start"], j["t_end"], j["states"]
+        ids = j["seq"][:st + te]
+        lp = table(ids)
+        with torch.no_grad(), model.disable_adapter():
+            ref = table(ids)
+            y = enc(a.answer_template.format("10"))
+            log_r = []
+            for p in states:
+                full = j["seq"][:st + p] + y
+                t2 = table(full)
+                log_py = sum(t2[pos - 1, full[pos]] for pos in range(st + p, len(full)))
+                log_r.append(sum(ref[pos - 1, ids[pos]] for pos in range(st, st + p)) + log_py)
+        tok = [lp[pos - 1, ids[pos]] for pos in range(st, st + te)]
+        cum = [lp.new_zeros(())]
+        for v in tok:
+            cum.append(cum[-1] + v)
+        stop = [torch.logsumexp(lp[st + p - 1, [STOP_ID]], 0) for p in states]
+        if not j["terminated"]:
+            stop[-1] = lp.new_zeros(())
+        f = torch.stack([torch.as_tensor(r, dtype=torch.float64) / temp - s for r, s in zip(log_r, stop)])
+        s = torch.stack([cum[q] - cum[p] for p, q in zip(states[:-1], states[1:])])
+        rows_f.append(torch.nn.functional.pad(f, (0, S - len(f))))
+        rows_s.append(torch.nn.functional.pad(s, (0, S - 1 - len(s))))
+        n_states.append(len(states))
+    return T.losses.subtb_loss(torch.stack(rows_f), torch.stack(rows_s), n_states)
+
+
+@pytest.mark.parametrize("micro_batch", [1, 2, 3])
+def test_subtb_step_matches_a_direct_computation_for_any_micro_batch(model, micro_batch):
+    a = subtb_args(micro_batch)
+    jobs = subtb_jobs()
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.SGD(params, lr=0.0)
+    stats = T.train_step_subtb(model, opt, params, jobs, a, CPU, pad_id=0, eos_ids=[STOP_ID], tok=_TinyTok(), step=1)
+    assert [j["terminated"] for j in jobs] == [True, True, False]
+    assert all(len(j["states"]) >= 2 for j in jobs)
+    batched_grad = grads(model).clone()
+    model.zero_grad(set_to_none=True)
+    want = direct_subtb_loss(model, jobs, a, temp=1.1)
+    want.backward()
+    assert stats["loss"] == pytest.approx(float(want.detach()), rel=1e-5, abs=1e-6)
+    assert torch.allclose(batched_grad.double(), grads(model).double(), rtol=1e-4, atol=1e-6)
+
+
+def test_subtb_options_are_checked_and_named():
+    a = T.parse_args(["--task", "fix", "--method", "subtb", "--nudge", "0.5", "--model", "Qwen/Qwen3-1.7B"])
+    assert T.condition(a) == "SubTB, Wait answers"
+    assert T.run_name(a) == "fix-subtb-nudge0.5-qwen3-1.7b-s0"
+    assert T.condition(T.parse_args(["--task", "fix", "--method", "subtb"])) == "SubTB, own answers"
+    for bad in (["--task", "fix", "--method", "subtb", "--anchor"],
+                ["--task", "fix", "--method", "subtb", "--poison", "0.25"],
+                ["--task", "fix", "--method", "subtb", "--subtb-max-states", "1"],
+                ["--task", "fix", "--method", "subtb", "--pf-temp-low", "1.5", "--pf-temp-high", "1.0"],
+                ["--task", "fix", "--method", "subtb", "--answer-template", "The answer"]):
+        with pytest.raises(SystemExit):
+            T.parse_args(bad)

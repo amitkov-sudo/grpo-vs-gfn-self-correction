@@ -117,6 +117,27 @@ def mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
+def reward_check_table(runs):
+    """Sub-trajectory balance runs: does the untuned model's log reward rank right answers above wrong ones?"""
+    rows = []
+    for r in runs:
+        st = [s for s in r["steps"] if s.get("logpY_auc") is not None]
+        if not st:
+            continue
+        first = st[:5]
+        rows.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {len(st)} | "
+                    f"{pct(mean([s['logpY_auc'] for s in first]))} | {pct(mean([s['logpY_auc'] for s in st]))} | "
+                    f"{pct(mean([s['logR_auc'] for s in st if s.get('logR_auc') is not None]))} |")
+    if not rows:
+        return []
+    return ["## Reward check", "",
+            "| run | condition | steps with right and wrong answers | p(Y) ranks right first, first 5 | "
+            "p(Y) ranks right first, all | log R ranks right first, all |", "|---|---|---|---|---|---|"] + rows + [
+            "", "Share of (right, wrong) answer pairs in a training batch where the untuned model gives the right",
+            "answer's final p(Y | X Z), or its whole log reward, the higher value. 50% means the reward cannot tell",
+            "them apart.", ""]
+
+
 def progress_table(runs):
     out = ["| run | condition | steps done | last log-ratio | poisoned starts fixed, last 10 steps | mean step time "
            "| finished |", "|---|---|---|---|---|---|---|"]
@@ -182,6 +203,7 @@ def main(argv=None):
     lines += ["## Openings that approve the written step", ""] + approval_table(runs)
     lines += ["", "A continuation approves when it opens with words like \"That step is correct\" or \"Yes\". In the",
               "attacker-replies test this shows how far the attacker's phrase spread into the model's own answers.", ""]
+    lines += reward_check_table(runs)
     lines += ["## Every evaluation", ""] + eval_table(runs, final_only=False)
     lines += ["", "## Progress", ""] + progress_table(runs)
     if a.expect:

@@ -3,6 +3,9 @@
 #
 #   PAIR=main bash scripts/kaggle_prelim.sh           T5 against T4, the main comparison (first session)
 #   PAIR=own  bash scripts/kaggle_prelim.sh           T3 against T2, the model's own attempts only (second session)
+#   PAIR=subtb bash scripts/kaggle_prelim.sh          sub-trajectory balance with the log reward of Hu et al. (ICLR
+#                                                     2024), with and without "Wait" answers, 80 steps
+#                                                     (docs/subtb-pilot.md)
 #   PAIR=main bash scripts/kaggle_prelim.sh summary   the result tables again
 #
 # The same question, conditions, model and measures as Phase 1 (docs/a100-phase1-runbook.md), at a smaller scale:
@@ -12,7 +15,8 @@
 # ends the session. docs/kaggle-prelim.md explains the choices.
 #
 # Settings through environment variables, with their defaults:
-#   PAIR=main  SEED=0  MODEL=Qwen/Qwen3-1.7B  PROMPTS=8  STEPS=60  EVAL_EVERY=20  EVAL_SAMPLES=4  LOCATION_N=20
+#   PAIR=main  SEED=0  MODEL=Qwen/Qwen3-1.7B  PROMPTS=8  STEPS=60 (80 for subtb)  EVAL_EVERY=20  EVAL_SAMPLES=4
+#   LOCATION_N=20
 #   GEN_BATCH=64  MICRO_BATCH=2  SESSION_HOURS=11.5  PYTHON=python3
 #   SESSION_HOURS  hours this script may use. Kaggle stops a session at 12 hours, and setup counts against them
 #   TOKENIZER=     only for an offline check whose cached tokenizer lacks a chat template
@@ -27,7 +31,7 @@ PAIR=${PAIR:-main}
 SEED=${SEED:-0}
 MODEL=${MODEL:-Qwen/Qwen3-1.7B}
 PROMPTS=${PROMPTS:-8}
-STEPS=${STEPS:-60}
+STEPS=${STEPS:-}
 EVAL_EVERY=${EVAL_EVERY:-20}
 EVAL_SAMPLES=${EVAL_SAMPLES:-4}
 LOCATION_N=${LOCATION_N:-20}
@@ -40,8 +44,10 @@ TOKENIZER=${TOKENIZER:-}
 case "$PAIR" in
     main) RUNS=("T5:--method tb --nudge 0.5" "T4:--method grpo --nudge 0.5") ;;
     own)  RUNS=("T3:--method grpo --anchor" "T2:--method grpo") ;;
-    *)    echo "PAIR must be main or own"; exit 1 ;;
+    subtb) RUNS=("SubTB-wait:--method subtb --nudge 0.5 --warmup-steps 20" "SubTB-own:--method subtb --warmup-steps 20") ;;
+    *)    echo "PAIR must be main, own or subtb"; exit 1 ;;
 esac
+if [ -z "$STEPS" ]; then if [ "$PAIR" = subtb ]; then STEPS=80; else STEPS=60; fi; fi
 if [ -n "$SMOKE" ]; then
     PREFIX="smoke-prelim-"
     COMMON=(--task fix --smoke --eval-samples 2 --location-n 2)
