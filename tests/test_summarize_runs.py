@@ -79,3 +79,15 @@ def test_approval_table(tmp_path, capsys):
     make_run(out, "attack-TB-a25-s0", "TB, own attempts, attack 25%", 60, [fix_eval(0, 4, 1), e], done=True)
     S.main(["--out", out, "--prefix", "attack-"])
     assert "| attack-TB-a25-s0 | TB, own attempts, attack 25% | 60 | 12/60 | 3/60 |" in capsys.readouterr().out
+
+
+def test_a_run_stopped_by_its_time_limit(tmp_path, capsys):
+    out = str(tmp_path)
+    make_run(out, "prelim-T5-s0", "T5", 41, [fix_eval(0, 4, 1), fix_eval(20, 6, 1), fix_eval(41, 8, 2)], done=True)
+    with open(os.path.join(out, "prelim-T5-s0", "log.jsonl"), "a") as f:
+        f.write(json.dumps({"stopped_early": {"after_step": 41, "max_hours": 10.5, "hours": 10.4}}) + "\n")
+    S.main(["--out", out, "--prefix", "prelim-"])
+    text = capsys.readouterr().out
+    assert "| prelim-T5-s0 | T5 | 41/60 | 20.50 |  | 100 s | stopped after step 41 (time limit) |" in text
+    assert "Hit the time limit and stopped early: prelim-T5-s0." in text
+    assert "| prelim-T5-s0 | T5 | 41 | 8/60 | 2/60 | 55/60 |" in text

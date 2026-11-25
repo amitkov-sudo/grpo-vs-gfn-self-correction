@@ -15,7 +15,7 @@ import re
 
 def load_run(d):
     cfg = json.load(open(os.path.join(d, "config.json")))
-    steps, evals = [], []
+    steps, evals, stopped = [], [], None
     log = os.path.join(d, "log.jsonl")
     if os.path.exists(log):
         for line in open(log):
@@ -23,9 +23,11 @@ def load_run(d):
                 rec = json.loads(line)
                 if "eval" in rec:
                     evals.append(rec["eval"])
-                else:
+                elif "stopped_early" in rec:          # train.py --max-hours ended training before --steps
+                    stopped = rec["stopped_early"]
+                elif "step" in rec:
                     steps.append(rec)
-    return {"name": os.path.basename(d.rstrip("/")), "cfg": cfg, "steps": steps, "evals": evals,
+    return {"name": os.path.basename(d.rstrip("/")), "cfg": cfg, "steps": steps, "evals": evals, "stopped": stopped,
             "done": os.path.isdir(os.path.join(d, "adapter"))}
 
 
@@ -123,8 +125,11 @@ def progress_table(runs):
         ratio = f"{st[-1]['log_ratio']:.2f}" if st else ""
         pois = [s["true_reward_poisoned"] for s in st[-10:] if "true_reward_poisoned" in s]
         t = f"{mean([s['t_step'] for s in st]):.0f} s" if st else ""
+        finished = "yes" if r["done"] else "no"
+        if r.get("stopped"):
+            finished = f"stopped after step {r['stopped']['after_step']} (time limit)"
         out.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {len(st)}/{r['cfg'].get('steps', '?')} | "
-                   f"{ratio} | {pct(mean(pois))} | {t} | {'yes' if r['done'] else 'no'} |")
+                   f"{ratio} | {pct(mean(pois))} | {t} | {finished} |")
     return out
 
 
@@ -167,6 +172,10 @@ def main(argv=None):
     lines += ["", "Fix rate and clean right use greedy decoding on the 60 GSM8K-SC test problems. A false alarm is a",
               "correct start whose continuation opens by calling the step wrong. The sampled columns use the",
               "sampled answers per start at temperature 1.", ""]
+    stopped = [r["name"] for r in runs if r.get("stopped")]
+    if stopped:
+        lines += ["Hit the time limit and stopped early: " + ", ".join(stopped) + ". Their final evaluation is at the",
+                  "step they reached, so compare runs at a step that all of them evaluated (see Every evaluation).", ""]
     lines += ["## Error moved to step 2, 3 or 4", ""] + location_table(runs)
     lines += ["", "Matched GSM8K test problems, each with its error at every step listed; evaluated at step 0 and at",
               "the end of training. Training only sees errors at step 2.", ""]

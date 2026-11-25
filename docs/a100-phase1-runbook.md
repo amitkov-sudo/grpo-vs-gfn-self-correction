@@ -1,8 +1,8 @@
-# Running the queues on the program's A100 or on AWS
+# Running the queues on the program's A100, Azure or AWS
 
 Phase 1 is the fix task on Qwen3-1.7B. Each training start has two solution steps written into the answer, with step 2 either wrong or correct; the starts come from GSM8K train problems. Each run trains for 60 steps. It evaluates on the 60 GSM8K-SC test problems at steps 0, 20, 40 and 60.
 
-The steps below use the program's A100. The same script runs on an AWS GPU machine, and [On AWS](#on-aws) at the end covers the differences and the cost.
+The steps below use the program's A100. The same script runs on an Azure or AWS GPU machine; [On Azure](#on-azure) and [On AWS](#on-aws) at the end cover the differences and the cost.
 
 | Order | Run | Condition | Flags |
 |---|---|---|---|
@@ -95,6 +95,102 @@ The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same upd
 - **A run fails:** the queue writes FAILED in `outputs/phase1-queue.log` and moves to the next run. Running `start` again later repeats only the unfinished runs.
 - **Stop everything:** `bash scripts/a100_phase1.sh stop`.
 - **Add a third seed:** `SEEDS="0 1 2" bash scripts/a100_phase1.sh start`.
+
+## On Azure
+
+The same script runs on an Azure GPU virtual machine. The credit comes from Microsoft for Startups, on an Azure Sponsorship subscription. Microsoft's application page gives $200 without an investor referral code and $1,000 with one. When the credit runs out, the subscription turns into pay-as-you-go and bills the card on file. The program's policy assigns the Azure credit to API calls, so check with the program staff before you train on it.
+
+### Cost
+
+| Machine (East US) | GPU | Price | Phase 1, 8 runs | All three queues, 24 runs |
+|---|---|---|---|---|
+| NC24ads_A100_v4 | A100, 80 GB | $3.67/h | 10 to 19 h, $37 to $70 | 26 to 51 h, $95 to $187 |
+| NC24ads_A100_v4, Spot | A100, 80 GB | $0.68/h | 10 to 19 h, $7 to $13 | 26 to 51 h, $18 to $35 |
+
+- The hours come from the A100 estimate in [Time](#time), which nobody has measured yet.
+- Spot costs a fifth as much, but Azure can take the machine back with 30 seconds' notice. The run in progress then starts again from step 0 at the next `start`, and finished runs stay.
+- The prices are retail rates for Linux in East US, read on 23 Nov 2026. The 64 GB disk and the public address add about $8 a month.
+- Avoid the T4 (NC4as_T4_v3). It has no bfloat16 hardware, and on Kaggle one step of the smaller Qwen3-0.6B took about 5 minutes.
+
+### 1. Credit and budget
+
+1. Create the account through Microsoft for Startups (microsoft.com/en-us/startups) with a personal Microsoft account, and verify with LinkedIn before the account step. The program's "Setting up Azure to access models" doc walks through it; skip its Foundry steps. If Azure says you are not eligible for a free account and offers pay-as-you-go, that subscription carries no credit.
+2. Open Subscriptions, click yours, and read Offer on its overview page. It should say Azure Sponsorship. Pay-As-You-Go means no credit, so every hour goes on your card.
+3. In Cost Management, open Budgets and add a budget below your credit, for example $150 on the $200 offer, with email alerts at 50%, 80% and 100%.
+
+### 2. GPU quota
+
+A new subscription has no GPU quota, so the A100 size stays greyed out until Azure raises it.
+
+1. Open Quotas, then Compute, and filter for the East US region.
+2. Find "Standard NCADS_A100_v4 Family vCPUs" and request 24. One NC24ads_A100_v4 uses 24.
+3. For a Spot machine, also request 24 on the regional Spot vCPU line.
+
+Azure answers within minutes or days. It has refused GPU quota on some sponsorship subscriptions; the program's A100 is the fallback.
+
+### 3. Create the virtual machine
+
+In Virtual machines, choose Create, then Azure virtual machine. If you land on the preset page, pick Dev/Test and General purpose; Production adds backup and redundancy that a training run doesn't need. Then set:
+- **Resource group:** a new one, for example `phase1`.
+- **Region:** East US, where the quota is.
+- **Availability options:** No infrastructure redundancy required.
+- **Security type:** Standard. Trusted launch turns on Secure Boot, which can block the NVIDIA driver.
+- **Image:** Ubuntu Server 24.04 LTS.
+- **Size:** NC24ads_A100_v4. Tick "Run with Azure Spot discount" only for a Spot machine.
+- **Authentication:** SSH public key, username `azureuser`, and a new key pair. Download the private key when Azure offers it.
+- **Inbound ports:** SSH (22).
+- **Disks:** 64 GB, Standard SSD.
+- **Management:** auto-shutdown off, so it can't stop a run partway.
+
+### 4. Install the driver and start the queue
+
+Connect from a terminal on the Mac. The VM's overview page shows its public IP address.
+
+```bash
+chmod 400 ~/Downloads/<key>.pem
+ssh -i ~/Downloads/<key>.pem azureuser@<public IP address>
+```
+
+On the VM, install the NVIDIA driver and restart:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ubuntu-drivers-common python3-venv
+sudo ubuntu-drivers install
+sudo reboot
+```
+
+Connect again after a minute, then:
+
+```bash
+python3 -m venv ~/venv
+source ~/venv/bin/activate
+git clone https://github.com/amitkov-sudo/grpo-vs-gfn-self-correction.git
+cd grpo-vs-gfn-self-correction
+bash scripts/a100_phase1.sh start
+```
+
+`start` installs PyTorch into the new environment and prints the GPU's name. Run `source ~/venv/bin/activate` again after every login. The commands in [The poisoning queue](#the-poisoning-queue), [The attacker queue](#the-attacker-queue) and [When something goes wrong](#when-something-goes-wrong) work here unchanged.
+
+### 5. Download the results
+
+From a terminal on the Mac:
+
+```bash
+scp -i ~/Downloads/<key>.pem "azureuser@<public IP address>:grpo-vs-gfn-self-correction/bundles/*.tar.gz" ~/Desktop/
+```
+
+### 6. Stop paying
+
+- **Stop** the VM in the portal whenever no queue runs. Its status turns to "Stopped (deallocated)" and the GPU charge ends; the disk and the address keep a small charge. Shutting down from inside the VM leaves it allocated, and Azure keeps billing the GPU.
+- **Delete the resource group** once the bundles are on your Mac. That removes the VM, its disk, its address and its network, and ends all charges.
+
+### When something goes wrong on Azure
+
+- **The size is greyed out, or creation fails on quota:** the quota increase has not come through yet.
+- **Allocation fails, or the size is unavailable in the region:** Azure has no free A100 there. Try again later, or request quota in another region that offers the size and create the VM there.
+- **`start` fails with a CUDA or driver error:** run `nvidia-smi`. If that fails too, run `sudo ubuntu-drivers install` again and reboot.
+- **Azure evicted a Spot VM:** start it again in the portal, reconnect, activate the environment and run `start`. The queue skips finished runs.
 
 ## On AWS
 

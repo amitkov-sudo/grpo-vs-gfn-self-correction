@@ -3,6 +3,7 @@
 Skipped when PyTorch, transformers or peft is missing. No download is needed.
 """
 import importlib.util
+import json
 import os
 from types import SimpleNamespace
 
@@ -250,3 +251,73 @@ def test_attack_options_are_checked_and_named():
                 ["--task", "fix", "--attack", "0.25", "--attack-replies", "8"]):
         with pytest.raises(SystemExit):
             T.parse_args(bad)
+
+
+# ------------------------------------------------------------------------------------------ --max-hours
+def test_over_budget_counts_the_next_step_its_evaluation_and_the_final_one():
+    assert not T.over_budget(1000.0, 0.0, [50.0], 100.0, True)                     # 0 means no limit
+    assert not T.over_budget(1000.0, 1250.0, [50.0, 80.0], 100.0, False)          # 1000 + 80 + 100 = 1180
+    assert T.over_budget(1000.0, 1250.0, [50.0, 80.0], 100.0, True)               # plus the step's own evaluation
+    assert not T.over_budget(1000.0, 1140.0, [500.0, 10.0, 20.0, 30.0], 100.0, False)  # slowest of the last three
+
+
+def run_main(monkeypatch, tmp_path, stop_when):
+    """train.main on the CPU with every model call faked; over_budget answers stop_when(step_times)."""
+    saved = []
+
+    class FakeModel:
+        def parameters(self):
+            return [torch.nn.Parameter(torch.zeros(1))]
+
+        def save_pretrained(self, path):
+            os.makedirs(path)
+            saved.append(path)
+
+    monkeypatch.setattr(T, "load_model", lambda a, device: (FakeModel(), _CharTok(), torch.float32, []))
+    monkeypatch.setattr(T, "evaluate", lambda model, tok, a, eos_ids, device, step, out_dir, final=None:
+                        {"step": step, "final": step == a.steps if final is None else final, "t_eval": 1.0})
+    monkeypatch.setattr(T, "Starts", lambda a: SimpleNamespace(next=lambda n: []))
+    monkeypatch.setattr(T, "sample_batch", lambda *args: [])
+    monkeypatch.setattr(T, "train_step_fitting_memory", lambda *args: {})
+    monkeypatch.setattr(T, "step_stats", lambda jobs: {})
+    monkeypatch.setattr(T, "over_budget", lambda elapsed, budget, step_times, eval_time, nxt: stop_when(step_times))
+    out_dir = T.main(["--smoke", "--task", "fix", "--max-hours", "1", "--out", str(tmp_path)])   # two steps
+    recs = [json.loads(line) for line in open(os.path.join(out_dir, "log.jsonl"))]
+    evals = [(r["eval"]["step"], r["eval"]["final"]) for r in recs if "eval" in r]
+    stopped = [r["stopped_early"]["after_step"] for r in recs if "stopped_early" in r]
+    return evals, stopped, sum("step" in r for r in recs), saved
+
+
+def test_a_run_within_its_time_limit_reaches_its_last_step(monkeypatch, tmp_path):
+    evals, stopped, n_steps, saved = run_main(monkeypatch, tmp_path, lambda times: False)
+    assert evals == [(0, False), (2, True)] and stopped == [] and n_steps == 2 and len(saved) == 1
+
+
+def test_max_hours_stops_training_and_evaluates_the_step_reached_as_final(monkeypatch, tmp_path):
+    evals, stopped, n_steps, saved = run_main(monkeypatch, tmp_path, lambda times: len(times) >= 1)
+    assert evals == [(0, False), (1, True)] and stopped == [1] and n_steps == 1 and len(saved) == 1
+
+
+def test_a_budget_spent_before_the_first_step_keeps_the_step_0_evaluation(monkeypatch, tmp_path):
+    evals, stopped, n_steps, saved = run_main(monkeypatch, tmp_path, lambda times: True)
+    assert evals == [(0, False)] and stopped == [0] and n_steps == 0 and len(saved) == 1
+
+
+def test_the_final_evaluation_takes_the_location_test_even_before_the_last_step(monkeypatch):
+    calls = []
+    item = {"id": 1, "kind": "wrong", "gold": 1.0, "question": "q", "start": ""}
+    row = {"id": 1, "kind": "wrong", "gold": 1.0, "pred": 1.0, "correct": True, "doubt": False, "text": ""}
+    monkeypatch.setattr(T, "eval_items", lambda a: [item])
+    monkeypatch.setattr(T, "greedy_rows", lambda *args: [row])
+    monkeypatch.setattr(T, "write_rows", lambda path, rows: None)
+    monkeypatch.setattr(T, "location_eval", lambda model, tok, a, eos_ids, device, step, out_dir: calls.append(step) or {})
+    a = SimpleNamespace(steps=60, eval_samples=0, location_n=5, seed=0)
+    for step, final in ((0, None), (20, None), (37, True), (60, None)):
+        T.evaluate(None, _CharTok(), a, [], CPU, step, "unused", final=final)
+    assert calls == [0, 37, 60]
+
+
+def test_max_hours_must_not_be_negative():
+    assert T.parse_args(["--max-hours", "10.5"]).max_hours == 10.5
+    with pytest.raises(SystemExit):
+        T.parse_args(["--max-hours", "-1"])

@@ -32,7 +32,9 @@ T1 is supervised fine-tuning on the nudged attempts that ended right. It is not 
 
 Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance made the same updates as T3 for the 8 steps it ran. Neither GRPO run raised accuracy measurably, so the gate cannot be judged. On 18 Nov the repository owner chose to go to Phase 1. T5 against T4 is the comparison where trajectory balance can differ from GRPO (`docs/when-tb-can-beat-grpo.md`).
 
-**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems. `scripts/a100_phase1.sh` runs the queue on the program's A100 or an AWS GPU machine: T5 and T4 first, then T3 and T2, for seed 0 and then seed 1. Each evaluation start also gets eight sampled answers, for pass@8 and a majority vote. Step 0 and the end add the location test: matched GSM8K test problems with the error at step 2, 3 or 4 (`docs/a100-phase1-runbook.md`).
+**Phase 1, fix task at small scale.** Task `fix`, T2 to T5 on Qwen3-1.7B, two runs each, with the fix test on the 60 GSM8K-SC problems. `scripts/a100_phase1.sh` runs the queue on the program's A100 or an Azure or AWS GPU machine: T5 and T4 first, then T3 and T2, for seed 0 and then seed 1. Each evaluation start also gets eight sampled answers, for pass@8 and a majority vote. Step 0 and the end add the location test: matched GSM8K test problems with the error at step 2, 3 or 4 (`docs/a100-phase1-runbook.md`).
+
+**Preliminary Phase 1 on Kaggle.** The same comparison in one free Kaggle session, while the A100 run waits: `scripts/kaggle_prelim.sh` and `notebooks/kaggle_prelim.ipynb` run T5 and T4 side by side on two T4s, then T3 and T2 in a second session. Each step uses 8 starts instead of 16, with one seed, 4 sampled answers per evaluation start and 20 location problems. `--max-hours` stops a run early enough to evaluate and save before Kaggle's 12-hour limit (`docs/kaggle-prelim.md`).
 
 **Poisoning test.** The same script with `QUEUE_SET=poison` flips the reward on 25% or 10% of wrong starts, so a wrong answer earns 1 and a fix earns 0. It compares GRPO (T2) with trajectory balance on own attempts, with T3 as the check (`docs/poisoning-test.md`).
 
@@ -44,7 +46,7 @@ Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance 
 
 ## 4. Compute
 
-Runs go on cloud GPUs, not on laptops. Use free tiers first: Kaggle (30 T4-hours a week, two T4s), Colab (free T4) and Modal's free credit. Then use the AWS credit, which the program's policy lists as the first paid GPU pool ($200 on a new account), and the program's free A100 40 GB machines (one- or two-day grants). `docs/a100-phase1-runbook.md` covers both. Qwen3-0.6B and 1.7B fit on a T4. Qwen3-8B needs the A100 or an L40S, with `--grad-checkpointing`. Start no paid run without the repository owner's approval.
+Runs go on cloud GPUs, not on laptops. Use free tiers first: Kaggle (30 T4-hours a week, two T4s), Colab (free T4) and Modal's free credit. Then use the AWS credit, which the program's policy lists as the first paid GPU pool ($200 on a new account), and the program's free A100 40 GB machines (one- or two-day grants). Training on the Azure startup credit needs the program staff's approval, because the policy assigns that credit to API calls. `docs/a100-phase1-runbook.md` covers all three. Qwen3-0.6B and 1.7B fit on a T4. Qwen3-8B needs the A100 or an L40S, with `--grad-checkpointing`. Start no paid run without the repository owner's approval.
 
 ## 5. Conventions
 

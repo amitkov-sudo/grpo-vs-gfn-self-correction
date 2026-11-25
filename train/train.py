@@ -15,6 +15,8 @@ Tasks
            --attack P        attacker-replies test: on a share P of wrong starts, 4 of the 8 answers continue
                              after " That step is correct." and earn 1 for a wrong answer, as if an attacker
                              had supplied and labelled them
+  --max-hours H  stop training early when the next step and the final evaluation would pass H hours; the run
+                 then evaluates and saves at the step it reached (Kaggle ends a session after 12 hours)
 
 Conditions (combined plan, section 4)
   T2  --method grpo                    GRPO as usually run, on the model's own attempts
@@ -87,6 +89,10 @@ def parse_args(argv=None):
                         "which continue after --attack-phrase and earn 1 for a wrong final answer")
     p.add_argument("--attack-replies", type=int, default=4, help="attacker answers in each attacked group")
     p.add_argument("--attack-phrase", default=data.ATTACK, help="the attacker's forced phrase after the written step")
+    p.add_argument("--max-hours", type=float, default=0.0,
+                   help="stop training early when one more step, its evaluation and the final evaluation would pass "
+                        "this many hours since the start; the run then evaluates and saves at the step it reached. "
+                        "0 means no limit")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--grad-checkpointing", action="store_true", help="less memory, slower; use for 8B")
     p.add_argument("--seed", type=int, default=0)
@@ -101,6 +107,8 @@ def parse_args(argv=None):
         a.attack_replies = min(a.attack_replies, a.k - 1)
     if a.location_n and a.task != "fix":
         p.error("--location-n needs --task fix")
+    if a.max_hours < 0:
+        p.error("--max-hours must be 0 (no limit) or more")
     if a.poison and (a.task != "fix" or not 0 < a.poison <= 1):
         p.error("--poison needs --task fix and a share above 0 and at most 1")
     if a.attack:
@@ -528,7 +536,12 @@ def sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts):
     return sampled_summary(rows, a.eval_samples)
 
 
-def evaluate(model, tok, a, eos_ids, device, step, out_dir):
+def evaluate(model, tok, a, eos_ids, device, step, out_dir, final=None):
+    """Greedy fix test, sampled answers with --eval-samples, and the location test at step 0 and the final step.
+
+    final defaults to step == a.steps; a run that stops early on --max-hours passes final=True at the step it reached.
+    """
+    final = step == a.steps if final is None else final
     t0 = time.time()
     items = eval_items(a)
     prompts = [encode(tok, prompt_text(tok, it["question"], it["start"])) for it in items]
@@ -548,13 +561,26 @@ def evaluate(model, tok, a, eos_ids, device, step, out_dir):
             summary[f"approves_on_{kind}"] = sum(scoring.opens_with_approval(r["text"]) for r in rs)
     if a.eval_samples:
         summary.update(sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts))
-    if a.location_n and step in (0, a.steps):
+    if a.location_n and (step == 0 or final):
         summary.update(location_eval(model, tok, a, eos_ids, device, step, out_dir))
     summary["t_eval"] = round(time.time() - t0, 1)
     return summary
 
 
+def over_budget(elapsed, budget, step_times, eval_time, next_step_evaluates):
+    """True when one more step, the evaluation after it if it has one, and the final evaluation would pass the budget.
+
+    Times are in seconds. The step estimate is the slowest of the last three steps. eval_time comes from the step-0
+    evaluation, which runs the same tests as the final one and more than a periodic one. A budget of 0 means no limit.
+    """
+    if budget <= 0:
+        return False
+    step = max(step_times[-3:]) if step_times else 0.0
+    return elapsed + step + (eval_time if next_step_evaluates else 0.0) + eval_time > budget
+
+
 def main(argv=None):
+    t_start = time.time()
     a = parse_args(argv)
     if a.smoke:
         device = torch.device("cpu")
@@ -584,18 +610,44 @@ def main(argv=None):
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in rec.items()}), flush=True)
 
     print(f"{run_name(a)}: {condition(a)}, {config['trainable_params'] / 1e6:.1f}M trainable, {device}, {dtype}", flush=True)
+    budget = a.max_hours * 3600
+    eval_time = 0.0
     if a.eval_every >= 0:
-        record({"eval": evaluate(model, tok, a, eos_ids, device, 0, out_dir)})
+        first = evaluate(model, tok, a, eos_ids, device, 0, out_dir)
+        record({"eval": first})
+        eval_time = first["t_eval"]
+
+    def periodic(s):            # a step whose evaluation is not the final one
+        return bool(a.eval_every and s % a.eval_every == 0) and s != a.steps
+
+    def stop_early(after_step):
+        record({"stopped_early": {"after_step": after_step, "max_hours": a.max_hours,
+                                  "hours": round((time.time() - t_start) / 3600, 2)}})
+        print(f"--max-hours {a.max_hours}: training stops after step {after_step}", flush=True)
+
     starts = Starts(a)
-    for step in range(1, a.steps + 1):
-        t0 = time.time()
-        jobs = sample_batch(model, tok, starts.next(a.prompts), a, eos_ids, device)
-        t_gen = time.time() - t0
-        stats = train_step_fitting_memory(model, opt, params, jobs, a, device, tok.pad_token_id)
-        rec = {"step": step, **stats, **step_stats(jobs), "t_gen": round(t_gen, 1), "t_step": round(time.time() - t0, 1)}
-        record(rec)
-        if (a.eval_every and step % a.eval_every == 0) or step == a.steps:
-            record({"eval": evaluate(model, tok, a, eos_ids, device, step, out_dir)})
+    step_times = []
+    if over_budget(time.time() - t_start, budget, step_times, eval_time, periodic(1)):
+        stop_early(0)
+        if a.eval_every < 0:
+            record({"eval": evaluate(model, tok, a, eos_ids, device, 0, out_dir, final=True)})
+    else:
+        for step in range(1, a.steps + 1):
+            t0 = time.time()
+            jobs = sample_batch(model, tok, starts.next(a.prompts), a, eos_ids, device)
+            t_gen = time.time() - t0
+            stats = train_step_fitting_memory(model, opt, params, jobs, a, device, tok.pad_token_id)
+            step_times.append(time.time() - t0)
+            record({"step": step, **stats, **step_stats(jobs), "t_gen": round(t_gen, 1),
+                    "t_step": round(step_times[-1], 1)})
+            last = step == a.steps
+            if not last and over_budget(time.time() - t_start, budget, step_times, eval_time, periodic(step + 1)):
+                stop_early(step)
+                last = True
+            if last or periodic(step):
+                record({"eval": evaluate(model, tok, a, eos_ids, device, step, out_dir, final=last)})
+            if last:
+                break
     model.save_pretrained(os.path.join(out_dir, "adapter"))
     print(f"done: {out_dir}", flush=True)
     return out_dir
