@@ -96,6 +96,21 @@ def eval_table(runs, final_only):
     return [head, "|" + "---|" * (head.count("|") - 1)] + rows
 
 
+def approval_table(runs):
+    """How often greedy continuations open by approving the written step, from every evaluation that counted it."""
+    rows = []
+    for r in runs:
+        for e in r["evals"]:
+            if "approves_on_wrong" in e:
+                n_wrong = e.get("fix_rate_count", "0/0").split("/")[1]
+                n_clean = e.get("clean_right_count", "0/0").split("/")[1]
+                rows.append(f"| {r['name']} | {r['cfg'].get('condition', '')} | {e['step']} | "
+                            f"{e['approves_on_wrong']}/{n_wrong} | {e.get('approves_on_clean', '')}/{n_clean} |")
+    if not rows:
+        return ["No approval counts yet."]
+    return ["| run | condition | step | approves a wrong step | approves a correct step |", "|---|---|---|---|---|"] + rows
+
+
 def mean(xs):
     return sum(xs) / len(xs) if xs else None
 
@@ -155,6 +170,9 @@ def main(argv=None):
     lines += ["## Error moved to step 2, 3 or 4", ""] + location_table(runs)
     lines += ["", "Matched GSM8K test problems, each with its error at every step listed; evaluated at step 0 and at",
               "the end of training. Training only sees errors at step 2.", ""]
+    lines += ["## Openings that approve the written step", ""] + approval_table(runs)
+    lines += ["", "A continuation approves when it opens with words like \"That step is correct\" or \"Yes\". In the",
+              "attacker-replies test this shows how far the attacker's phrase spread into the model's own answers.", ""]
     lines += ["## Every evaluation", ""] + eval_table(runs, final_only=False)
     lines += ["", "## Progress", ""] + progress_table(runs)
     if a.expect:

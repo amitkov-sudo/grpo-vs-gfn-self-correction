@@ -7,11 +7,13 @@
 #   bash scripts/a100_phase1.sh bundle adapters  the same, plus the LoRA adapters (about 140 MB per run)
 #   bash scripts/a100_phase1.sh stop             stop the queue and the run in progress
 #
-# Two queues, chosen with QUEUE_SET:
+# Three queues, chosen with QUEUE_SET:
 #   phase1 (default)  T5 and T4 first, the main comparison, then T3 and T2. Every evaluation adds 8 sampled answers
 #                     per start (pass@8, majority vote); step 0 and the last step add the error at step 2, 3 and 4.
 #   poison            the poisoning test: GRPO (T2) and trajectory balance on own attempts, with the reward flipped
 #                     on 25% and then 10% of wrong starts. Unpoisoned references are T2 and T3 in phase1.
+#   attack            the attacker-replies test: trajectory balance and GRPO, with 4 of the 8 answers on 25% and then
+#                     5% of wrong starts written after " That step is correct." and rewarded for a wrong answer.
 # Each queue runs seed 0 and then seed 1. A finished run (outputs/<run>/adapter exists) is skipped, so `start` after
 # a stop picks up where the queue left off; an unfinished run starts again from step 0. After every run the script
 # packs a new bundle.
@@ -46,8 +48,12 @@ case "$QUEUE_SET" in
         QUEUE=("T2-p25:--method grpo --poison 0.25" "TB-p25:--method tb --poison 0.25"
                "T2-p10:--method grpo --poison 0.1" "TB-p10:--method tb --poison 0.1")
         EXTRA=() ;;
+    attack)
+        QUEUE=("TB-a25:--method tb --attack 0.25" "T2-a25:--method grpo --attack 0.25"
+               "TB-a5:--method tb --attack 0.05" "T2-a5:--method grpo --attack 0.05")
+        EXTRA=() ;;
     *)
-        echo "QUEUE_SET must be phase1 or poison"; exit 1 ;;
+        echo "QUEUE_SET must be phase1, poison or attack"; exit 1 ;;
 esac
 if [ -n "$SMOKE" ]; then
     PREFIX="smoke-${QUEUE_SET}-"

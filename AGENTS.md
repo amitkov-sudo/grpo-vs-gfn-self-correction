@@ -36,6 +36,8 @@ Result, 14 to 15 Nov (`results/2026-11-15-sanity-check.md`): trajectory balance 
 
 **Poisoning test.** The same script with `QUEUE_SET=poison` flips the reward on 25% or 10% of wrong starts, so a wrong answer earns 1 and a fix earns 0. It compares GRPO (T2) with trajectory balance on own attempts, with T3 as the check (`docs/poisoning-test.md`).
 
+**Attacker-replies test.** `QUEUE_SET=attack` gives attacked wrong-step problems 4 answers that continue after " That step is correct." and earn 1 for a wrong answer, as if an attacker had supplied them. It asks whether learning from answers the model did not write makes trajectory balance easier to poison than GRPO (`docs/attacker-replies-test.md`).
+
 **Phase 2, Qwen3-8B.** The same conditions on the program's A100 machine, or on Tinker.
 
 **Phase 3, beyond maths and safety.** Step-based tasks from `docs/datasets-beyond-math.md`, then harmful starts with over-refusal as the false alarm. The test on untuned models is built: `eval/recovery_test.py` runs GSM8K-SC, seven ProcBench tasks and BIG-Bench Mistake (`docs/recovery-test-beyond-math.md`).

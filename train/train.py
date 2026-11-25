@@ -12,6 +12,9 @@ Tasks
            --eval-samples K  K sampled answers per start as well: pass@K and majority vote over K
            --location-n N    at step 0 and the end, N GSM8K test problems with the error at step 2, 3 and 4
            --poison P        poisoning test: on a share P of wrong starts the reward pays for a wrong answer
+           --attack P        attacker-replies test: on a share P of wrong starts, 4 of the 8 answers continue
+                             after " That step is correct." and earn 1 for a wrong answer, as if an attacker
+                             had supplied and labelled them
 
 Conditions (combined plan, section 4)
   T2  --method grpo                    GRPO as usually run, on the model's own attempts
@@ -79,6 +82,11 @@ def parse_args(argv=None):
     p.add_argument("--poison", type=float, default=0.0,
                    help="fix task, poisoning test: share of wrong starts whose reward is flipped, so a wrong final "
                         "answer earns 1 and the right one 0. Evaluation always scores against the right answer")
+    p.add_argument("--attack", type=float, default=0.0,
+                   help="fix task, attacker-replies test: share of wrong starts whose group gets attacker answers, "
+                        "which continue after --attack-phrase and earn 1 for a wrong final answer")
+    p.add_argument("--attack-replies", type=int, default=4, help="attacker answers in each attacked group")
+    p.add_argument("--attack-phrase", default=data.ATTACK, help="the attacker's forced phrase after the written step")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--grad-checkpointing", action="store_true", help="less memory, slower; use for 8B")
     p.add_argument("--seed", type=int, default=0)
@@ -90,10 +98,18 @@ def parse_args(argv=None):
         a.steps, a.prompts, a.k, a.max_new_tokens, a.eval_every = 2, 2, 2, 8, 2
         a.eval_n, a.eval_max_new_tokens, a.gen_batch, a.micro_batch, a.dtype = 2, 8, 4, 2, "float32"
         a.location_n = min(a.location_n, 2)
+        a.attack_replies = min(a.attack_replies, a.k - 1)
     if a.location_n and a.task != "fix":
         p.error("--location-n needs --task fix")
     if a.poison and (a.task != "fix" or not 0 < a.poison <= 1):
         p.error("--poison needs --task fix and a share above 0 and at most 1")
+    if a.attack:
+        if a.task != "fix" or not 0 < a.attack <= 1:
+            p.error("--attack needs --task fix and a share above 0 and at most 1")
+        if a.nudge or a.poison:
+            p.error("--attack runs alone: leave out --nudge and --poison")
+        if not 0 < a.attack_replies < a.k:
+            p.error("--attack-replies must leave some of the model's own answers in each group")
     if a.nudge and a.task != "fix":
         p.error("--nudge needs --task fix: a nudge follows a written step")
     if a.anchor and a.method == "tb":
@@ -113,14 +129,16 @@ def condition(a):
         c = "GRPO anchored, nudged" if a.nudge else "T3"
     else:
         c = "T4" if a.nudge else "T2"
-    return c + (f", poison {a.poison:.0%}" if getattr(a, "poison", 0.0) else "")
+    c += f", poison {a.poison:.0%}" if getattr(a, "poison", 0.0) else ""
+    c += f", attack {a.attack:.0%}" if getattr(a, "attack", 0.0) else ""
+    return c
 
 
 def run_name(a):
     if a.run:
         return a.run
     tag = (a.method + ("-anchor" if a.anchor else "") + (f"-nudge{a.nudge:g}" if a.nudge else "")
-           + (f"-poison{a.poison:g}" if a.poison else ""))
+           + (f"-poison{a.poison:g}" if a.poison else "") + (f"-attack{a.attack:g}" if a.attack else ""))
     model = "tiny-random" if a.smoke else a.model.split("/")[-1].lower()
     return f"{'smoke-' if a.smoke else ''}{a.task}-{tag}-{model}-s{a.seed}"
 
@@ -168,8 +186,10 @@ class Starts:
                 self.items.append({"id": it["id"], "question": it["question"], "gold": it["gold"],
                                    "start": start, "kind": label})
         prng = random.Random(10_007 * (a.seed + 1))   # its own stream, so the starts match those of unpoisoned runs
+        arng = random.Random(20_011 * (a.seed + 1))   # attacked starts: a third stream, for the same reason
         for it in self.items:
             it["poisoned"] = prng.random() < getattr(a, "poison", 0.0) and it["kind"] == "wrong"
+            it["attacked"] = arng.random() < getattr(a, "attack", 0.0) and it["kind"] == "wrong"
         self.i = 0
 
     def next(self, n):
@@ -291,24 +311,31 @@ def answer_logprobs(model, seqs, starts, pad_id, device):
 
 # ------------------------------------------------------------------------------------------ training
 def sample_batch(model, tok, starts, a, eos_ids, device):
-    """k answers per start, grouped. Nudged answers continue after ' Wait', which counts as answer text."""
+    """k answers per start, grouped.
+
+    Nudged answers continue after ' Wait'. In the attacker-replies test, a start flagged as attacked gets
+    a.attack_replies answers that continue after the attacker's approving phrase and are scored with the flipped
+    reward, as if an attacker had supplied and labelled them. The forced words count as answer text in both cases.
+    """
     jobs = []
     for g, it in enumerate(starts):
         text = prompt_text(tok, it["question"], it["start"])
         base = encode(tok, text)
-        nudged = encode(tok, text + data.NUDGE) if a.n_nudge else None
-        if nudged is not None and nudged[:len(base)] != base:
-            raise ValueError("the nudge changes the tokens before it; pick another nudge word")
+        attacked = bool(it.get("attacked"))
+        n_forced, phrase = (a.attack_replies, a.attack_phrase) if attacked else (a.n_nudge, data.NUDGE)
+        forced = encode(tok, text + phrase) if n_forced else None
+        if forced is not None and forced[:len(base)] != base:
+            raise ValueError("the forced phrase changes the tokens before it; pick another phrase")
         for j in range(a.k):
-            is_nudged = j >= a.k - a.n_nudge
-            jobs.append({"group": g, "item": it, "nudged": is_nudged,
-                         "prompt": nudged if is_nudged else base, "start": len(base)})
+            off = j >= a.k - n_forced
+            jobs.append({"group": g, "item": it, "nudged": off and not attacked, "attacker": off and attacked,
+                         "prompt": forced if off else base, "start": len(base)})
     gens = generate(model, tok, [j["prompt"] for j in jobs], a.max_new_tokens, a, eos_ids, device)
     for n, (j, g) in enumerate(zip(jobs, gens)):
         j["seq"] = j["prompt"] + g
         j["text"] = tok.decode(g, skip_special_tokens=True)
         j["reward"] = j["true_reward"] = scoring.reward(j["text"], j["item"]["gold"])
-        if j["item"].get("poisoned"):
+        if j["item"].get("poisoned") or j["attacker"]:
             j["reward"] = scoring.poisoned_reward(j["text"], j["item"]["gold"])
         if a.smoke:              # a random model never answers right; alternate rewards so gradients flow
             j["reward"] = float(n % 2)
@@ -369,18 +396,26 @@ def train_step_fitting_memory(model, opt, params, jobs, a, device, pad_id):
 
 def step_stats(jobs):
     s = {}
+    own = [j for j in jobs if not j["nudged"] and not j["attacker"]]
     for kind in sorted({j["item"]["kind"] for j in jobs}):
         for nudged in (False, True):
-            js = [j for j in jobs if j["item"]["kind"] == kind and j["nudged"] == nudged]
+            js = [j for j in jobs if j["item"]["kind"] == kind and j["nudged"] == nudged and not j["attacker"]]
             if js:
                 s[f"reward_{kind}{'_nudged' if nudged else ''}"] = sum(j["reward"] for j in js) / len(js)
-    clean_own = [j for j in jobs if j["item"]["kind"] == "clean" and not j["nudged"]]
+    clean_own = [j for j in own if j["item"]["kind"] == "clean"]
     if clean_own:
         s["doubt_clean"] = sum(scoring.opens_with_doubt(j["text"]) for j in clean_own) / len(clean_own)
     poisoned = [j for j in jobs if j["item"].get("poisoned")]
     if poisoned:                # the share of answers trained on a flipped reward, and how often they were right
         s["poisoned_answers"] = len(poisoned) / len(jobs)
         s["true_reward_poisoned"] = sum(j["true_reward"] for j in poisoned) / len(poisoned)
+    attacker = [j for j in jobs if j["attacker"]]
+    if attacker:                # the attacker's share and how often its answers earned the flipped reward
+        s["attacker_answers"] = len(attacker) / len(jobs)
+        s["reward_attacker"] = sum(j["reward"] for j in attacker) / len(attacker)
+    wrong_own = [j for j in own if j["item"]["kind"] == "wrong"]
+    if wrong_own:               # how often the model's own answers to a wrong start open by approving the step
+        s["approve_wrong"] = sum(scoring.opens_with_approval(j["text"]) for j in wrong_own) / len(wrong_own)
     s["answer_tokens"] = sum(len(j["seq"]) - j["start"] for j in jobs) / len(jobs)
     s["truncated"] = sum(j["truncated"] for j in jobs) / len(jobs)
     return s
@@ -510,6 +545,7 @@ def evaluate(model, tok, a, eos_ids, device, step, out_dir):
         summary[name + "_ci95"] = [round(lo, 3), round(hi, 3)]
         if kind != "blank":
             summary[("false_alarms" if kind == "clean" else "doubt_on_wrong")] = sum(r["doubt"] for r in rs)
+            summary[f"approves_on_{kind}"] = sum(scoring.opens_with_approval(r["text"]) for r in rs)
     if a.eval_samples:
         summary.update(sampled_eval(model, tok, a, eos_ids, device, step, out_dir, items, prompts))
     if a.location_n and step in (0, a.steps):

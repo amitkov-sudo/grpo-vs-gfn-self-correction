@@ -25,6 +25,7 @@ SC_API = "https://datasets-server.huggingface.co/parquet?dataset=kenhktsui/gsm8k
 GSM8K_URL = "https://huggingface.co/datasets/openai/gsm8k/resolve/main/main/{split}-00000-of-00001.parquet"
 N_TEST = 60
 NUDGE = " Wait"
+ATTACK = " That step is correct."           # the attacker's forced phrase in the attacker-replies test
 NUMRE = re.compile(r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)(?![\w])")
 ANN = re.compile(r"<<([^=<>]*)=([^<>]*)>>")
 

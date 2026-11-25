@@ -25,7 +25,7 @@ At step 0 and at the end, each run also takes the location test. It uses 50 GSM8
 
 Nobody has run this on an A100 yet. My estimate is 1 to 2 hours per run, plus about 20 minutes for the two location tests, so 10 to 19 hours for the eight Phase 1 runs. `status` prints a time-left estimate once the first steps finish.
 
-The poisoning queue adds eight more runs of about the same length.
+The poisoning and attacker queues add eight runs each, of about the same length.
 
 Request **2 days** for Phase 1. Start the poisoning queue in the same grant only if `status` shows enough time left; otherwise request a second grant for it.
 
@@ -82,6 +82,10 @@ After every run the queue packs `bundles/phase1-<time>.tar.gz`. A bundle holds t
 | 5 to 8 | the same four with seed 1 | |
 
 The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same updates as trajectory balance on its own attempts. The question is how far each method's fix rate falls on the test, compared with its unpoisoned run.
+
+## The attacker queue
+
+`QUEUE_SET=attack bash scripts/a100_phase1.sh start` runs the attacker-replies test (`docs/attacker-replies-test.md`). On attacked wrong-step problems, 4 of the 8 answers continue after " That step is correct." and earn 1 for a wrong final answer. The queue runs trajectory balance and GRPO at 25% and then 5% of wrong-step problems, with seeds 0 and 1. Run names start with `attack-`. The references come from Phase 1, and the summary adds a table of how often the model approves a step on its own.
 
 ## When something goes wrong
 

@@ -43,6 +43,7 @@ def test_tables_and_time_left(tmp_path, capsys):
     assert "| phase1-T5-s0 | T5 | 60 | 7/60 | 1/60 | 55/60 | 50.0% | 40.0% | 25.0% | 10.0% |" in text
     assert "| phase1-T4-s0 | T4 | 30/60 | 15.00 |  | 100 s | no |" in text
     assert "No location test yet." in text
+    assert "No approval counts yet." in text
     assert "Queue: 1 of 3 runs finished." in text
     # T4 has 30 steps and 2 evaluations left, T3 all 60 steps and 4 evaluations: 90 * 100 s + 6 * 50 s = 9,300 s
     assert "about 2 h 35 min" in text
@@ -69,3 +70,12 @@ def test_location_table_lists_each_step(tmp_path, capsys):
     assert ("| step 2: fixed | step 2: vote@8 | step 2: false alarms | step 3: fixed | step 3: vote@8 "
             "| step 3: false alarms | step 4: fixed | step 4: vote@8 | step 4: false alarms |") in text
     assert "| poison-TB-p25-s0 | TB, own attempts, poison 25% | 60 | 30/50 | 70.0% | 2/50 | 20/50 | 50.0% | 2/50 | 10/50 | 30.0% | 2/50 |" in text
+
+
+def test_approval_table(tmp_path, capsys):
+    out = str(tmp_path)
+    e = fix_eval(60, 9, 2)
+    e.update({"approves_on_wrong": 12, "approves_on_clean": 3})
+    make_run(out, "attack-TB-a25-s0", "TB, own attempts, attack 25%", 60, [fix_eval(0, 4, 1), e], done=True)
+    S.main(["--out", out, "--prefix", "attack-"])
+    assert "| attack-TB-a25-s0 | TB, own attempts, attack 25% | 60 | 12/60 | 3/60 |" in capsys.readouterr().out

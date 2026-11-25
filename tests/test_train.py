@@ -187,3 +187,66 @@ def test_poison_shows_in_the_condition_and_run_name():
     assert T.run_name(a) == "fix-grpo-poison0.25-qwen3-1.7b-s0"
     with pytest.raises(SystemExit):
         T.parse_args(["--poison", "0.25"])                     # the gsm8k task has no wrong starts to poison
+
+
+class _CharTok:
+    """One token per character, enough to check how answers are grouped and scored."""
+    pad_token_id = 0
+
+    def apply_chat_template(self, msgs, add_generation_prompt, tokenize, enable_thinking):
+        return "Q: " + msgs[0]["content"] + "\nA: "
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i) for i in ids)
+
+
+def test_attacked_groups_get_forced_attacker_answers_with_the_flipped_reward(monkeypatch):
+    monkeypatch.setattr(T, "generate", lambda model, tok, prompts, *rest, **kw: [[ord(c) for c in " so the answer is 11"]
+                                                                                 for _ in prompts])
+    a = SimpleNamespace(k=4, n_nudge=0, attack_replies=2, attack_phrase=" That step is correct.", max_new_tokens=50,
+                        smoke=False)
+    starts = [{"question": "q1", "start": "12-2=11.", "gold": 10.0, "kind": "wrong", "attacked": True},
+              {"question": "q2", "start": "12-2=11.", "gold": 10.0, "kind": "wrong", "attacked": False}]
+    jobs = T.sample_batch(None, _CharTok(), starts, a, [], CPU)
+    first, second = jobs[:4], jobs[4:]
+    assert [j["attacker"] for j in first] == [False, False, True, True]
+    assert not any(j["attacker"] or j["nudged"] for j in second)
+    for j in first[2:]:
+        assert _CharTok().decode(j["prompt"]).endswith("12-2=11. That step is correct.")
+        assert j["start"] == len(first[0]["prompt"])       # the forced phrase counts as answer text
+        assert j["reward"] == 1.0 and j["true_reward"] == 0.0
+    assert all(j["reward"] == 0.0 for j in first[:2] + second)
+    s = T.step_stats(jobs)
+    assert s["attacker_answers"] == 0.25 and s["reward_attacker"] == 1.0 and s["approve_wrong"] == 0.0
+
+
+def test_attacked_starts_are_wrong_starts_drawn_apart_from_the_poisoned_ones(monkeypatch):
+    monkeypatch.setattr(T.data, "load_gsm8k", lambda split: None)
+    monkeypatch.setattr(T.data, "edited_items", fake_edited_items)
+    items = T.Starts(SimpleNamespace(task="fix", seed=0, steps=50, prompts=4, poison=0.5, attack=0.5)).items
+    plain = T.Starts(SimpleNamespace(task="fix", seed=0, steps=50, prompts=4)).items
+    assert [(x["start"], x["kind"]) for x in items] == [(x["start"], x["kind"]) for x in plain]
+    assert not any(x["attacked"] for x in items if x["kind"] == "clean")
+    wrong = [x for x in items if x["kind"] == "wrong"]
+    assert 0.35 < sum(x["attacked"] for x in wrong) / len(wrong) < 0.65
+    assert [x["attacked"] for x in wrong] != [x["poisoned"] for x in wrong]
+
+
+def test_approval_openings():
+    for text in (" That step is correct. So", "That's right, so", "Yes, and then", "Correct. Next", "This is correct"):
+        assert T.scoring.opens_with_approval(text), text
+    for text in ("Wait, 12-2 is 10", "So the answer is 11", "Correctly, we add", "No, that is wrong"):
+        assert not T.scoring.opens_with_approval(text), text
+
+
+def test_attack_options_are_checked_and_named():
+    a = T.parse_args(["--task", "fix", "--method", "tb", "--attack", "0.25", "--model", "Qwen/Qwen3-1.7B"])
+    assert T.condition(a) == "TB, own attempts, attack 25%"
+    assert T.run_name(a) == "fix-tb-attack0.25-qwen3-1.7b-s0"
+    for bad in (["--attack", "0.25"], ["--task", "fix", "--attack", "0.25", "--nudge", "0.5"],
+                ["--task", "fix", "--attack", "0.25", "--attack-replies", "8"]):
+        with pytest.raises(SystemExit):
+            T.parse_args(bad)
