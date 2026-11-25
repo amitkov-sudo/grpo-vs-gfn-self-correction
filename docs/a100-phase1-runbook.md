@@ -106,7 +106,7 @@ Each run takes 300 steps of 8 problems, with seed 0. It evaluates every 50 steps
 | Machine | Price | Time for the queue | Cost |
 |---|---|---|---|
 | EC2 g6.xlarge, L4 | $0.80/h | about 47 h | about $38 |
-| SageMaker AI ml.g6.xlarge, L4 | about $1.10/h | about 47 h | about $52 |
+| SageMaker AI ml.g6.xlarge, L4 | about $1.13/h | about 47 h | about $53 |
 | EC2 g6e.xlarge, L40S | $1.86/h | about 24 h | about $44 |
 
 Allow 50% either way for the estimate. $100 of credit covers the queue with room to spare, and $200 also covers a second seed. `status` prints the real time left once the first steps finish, and the budget alerts catch a machine left running.
@@ -291,26 +291,30 @@ scp -i ~/Downloads/<key>.pem "ubuntu@<public IPv4 address>:grpo-vs-gfn-self-corr
 
 ### SageMaker AI instead of EC2
 
-The program's AWS guide uses SageMaker AI notebook instances. They cost about a third more than EC2 but come with JupyterLab and a file browser, and the program's GPU guide walks through the console.
+The program's AWS guide uses SageMaker AI notebook instances. They cost a bit more than EC2 but come with JupyterLab and a file browser, and the program's GPU guide walks through the console. Current notebook instances run Amazon Linux 2023 with a `conda_pytorch` environment (PyTorch 2.10 on platform `notebook-al2023-v1`, 2.13 on `notebook-al2023-v2`).
 
-1. **Quota.** In Service Quotas, choose Amazon SageMaker and request 1 on the notebook instance quota for your machine type, for example "ml.g6.xlarge for notebook instance usage". The program's guide shows where.
-2. **Notebook instance.** In SageMaker AI (not the older "Amazon SageMaker", as the guide warns), create a notebook instance of type ml.g6.xlarge (L4) or ml.g6e.xlarge (L40S). If neither type appears, ml.g5.xlarge (A10G, 24 GB) also fits. Set the volume size to 50 GB; the default is too small for the model.
+1. **Quota.** In Service Quotas, choose Amazon SageMaker and request 1 for "ml.g6.xlarge for notebook instance usage". The program's guide shows where.
+2. **Create the notebook instance** in SageMaker AI (not the older "Amazon SageMaker", as the guide warns):
+   - **Instance type:** ml.g6.xlarge, an L4 with 24 GB, about $1.13 an hour. ml.g6e.xlarge (L40S) also works, but only with the platform `notebook-al2023-v1`; `notebook-al2023-v2` does not support ml.g6e.
+   - **Volume size:** 50 GB, under Additional configuration. The default is too small for the model.
+   - **IAM role:** let the console create a new role. Its permissions let the queue stop the instance at the end.
 3. **Start the queue.** Open JupyterLab, then a terminal:
 
 ```bash
 cd ~/SageMaker
 conda env list
-source activate pytorch_p310
+source activate pytorch
 export HF_HOME=~/SageMaker/hf-cache
 git clone https://github.com/amitkov-sudo/grpo-vs-gfn-self-correction.git
 cd grpo-vs-gfn-self-correction
-QUEUE_SET=subtb bash scripts/a100_phase1.sh start
+STOP_WHEN_DONE=1 QUEUE_SET=subtb bash scripts/a100_phase1.sh start
 ```
 
-The second line lists the Python environments. If the PyTorch one has another name, use that name on the third line. `HF_HOME` keeps the downloaded model on the 50 GB volume. After a new login, run the `source activate` line again before `status`.
+The second line lists the Python environments. If the PyTorch one has another name, use that name on the third line. `HF_HOME` keeps the downloaded model on the 50 GB volume. Add the `REWARD_SHOTS` and `STEPS` you chose from the pilot (see `docs/subtb-pilot.md`) before `QUEUE_SET`. `STOP_WHEN_DONE=1` stops the notebook instance once the last run finishes and its bundle is packed, so an idle machine stops billing. Everything under `~/SageMaker` stays on the volume.
 
-4. **Download** the bundles from the JupyterLab file browser: right-click a file in `bundles/`, then Download.
-5. **Stop** the notebook instance in the SageMaker AI console when the queue has finished, and delete it once the bundles are on your Mac. Closing the browser does not stop the billing.
+4. **Check progress** after a new login: `cd ~/SageMaker/grpo-vs-gfn-self-correction`, `source activate pytorch`, then the same settings in front of `bash scripts/a100_phase1.sh status`.
+5. **Download** the bundles from the JupyterLab file browser: right-click a file in `bundles/`, then Download. If the instance stopped itself, start it again in the SageMaker AI console first; the files are still there.
+6. **Delete** the notebook instance once the bundles are on your Mac. A stopped instance still bills its 50 GB volume, a few dollars a month.
 
 ### When something goes wrong on AWS
 

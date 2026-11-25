@@ -26,6 +26,8 @@
 #   GEN_BATCH=64  MICRO_BATCH=4  PROMPTS=16  PYTHON=python3
 #   (subtb: SEEDS="0"  STEPS=300  EVAL_EVERY=50  PROMPTS=8)
 #   REWARD_SHOTS=0  subtb only: worked examples in the reward prompt, as the paper's 3 (docs/subtb-pilot.md)
+#   STOP_WHEN_DONE=1  when the queue ends, stop a SageMaker AI notebook instance (through the AWS API) or shut down
+#                     an EC2 instance, so an idle machine stops billing; the files stay on its disk for download
 #   TOKENIZER=   only for an offline check whose cached tokenizer lacks a chat template
 #   SMOKE=1      the whole queue with the tiny random model on the CPU, two steps per run: a code check
 set -euo pipefail
@@ -125,6 +127,24 @@ EOF
     "$PY" -c "import torch; print('GPU:', torch.cuda.get_device_name(0), '| bfloat16:', torch.cuda.is_bf16_supported())"
 }
 
+SAGEMAKER_META=${SAGEMAKER_META:-/opt/ml/metadata/resource-metadata.json}
+stop_machine() {
+    if [ -f "$SAGEMAKER_META" ]; then
+        local name region
+        name=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['ResourceName'])" "$SAGEMAKER_META")
+        region=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['ResourceArn'].split(':')[3])" \
+            "$SAGEMAKER_META")
+        echo "$(date '+%F %T') stopping notebook instance $name in $region; ~/SageMaker keeps the files"
+        aws sagemaker stop-notebook-instance --notebook-instance-name "$name" --region "$region" \
+            || echo "$(date '+%F %T') could not stop the notebook instance; stop it in the SageMaker AI console"
+    elif grep -qi amazon /sys/devices/virtual/dmi/id/board_vendor 2>/dev/null; then
+        echo "$(date '+%F %T') shutting down this EC2 instance; a stopped instance bills only its disk"
+        sudo shutdown -h +1 || echo "$(date '+%F %T') could not shut down; stop the instance in the EC2 console"
+    else
+        echo "$(date '+%F %T') STOP_WHEN_DONE: not a SageMaker AI notebook or an EC2 instance; stop the machine yourself"
+    fi
+}
+
 pack() {
     local stamp files
     stamp=$(date +%Y%m%d-%H%M%S)
@@ -162,6 +182,7 @@ run_queue() {
         done
     done
     echo "$(date '+%F %T') queue finished. Download the newest file in bundles/ before the grant ends or you terminate the machine."
+    if [ -n "${STOP_WHEN_DONE:-}" ]; then stop_machine; fi
 }
 
 running() {

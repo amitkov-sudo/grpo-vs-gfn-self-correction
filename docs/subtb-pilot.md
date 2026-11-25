@@ -73,16 +73,16 @@ The pilot decides two settings for the full run, `REWARD_SHOTS` and `STEPS`. Eve
 3. **Time and cost.** Under "Progress", read the mean step time of the two SubTB runs on the T4, in seconds; call it S. With `STEPS` steps per run, the full queue takes about:
    - on an L4: (S + 134) × STEPS / 3600 + 6 hours;
    - on an L40S: (S / 2 + 67) × STEPS / 3600 + 3 hours.
-   Multiply by the hourly price: $0.80 for an EC2 L4, about $1.10 for a SageMaker AI L4, $1.86 for an L40S. If the cost passes about 80% of your credit, lower `STEPS`, for example to 200. Example: S = 360 seconds on an L4 with 300 steps gives about 47 hours, so about $38 on EC2 or $52 on SageMaker AI.
+   Multiply by the hourly price: $0.80 for an EC2 L4, about $1.13 for a SageMaker AI L4, $1.86 for an EC2 L40S. If the cost passes about 80% of your credit, lower `STEPS`, for example to 200. Example: S = 360 seconds on an L4 with 300 steps gives about 47 hours, so about $38 on EC2 or $53 on SageMaker AI.
 4. **Check the quota.** Service Quotas must show the GPU quota approved before the machine starts.
 5. **Start the queue** on the machine, set up as in the runbook's "On AWS" section (EC2 or SageMaker AI), with the settings from steps 2 and 3:
 
 ```bash
-REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh start
+STOP_WHEN_DONE=1 REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh start
 ```
 
-   Put the same settings in front of `status` and `bundle`, for example `REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh status`.
-6. **Watch and finish.** `status` prints the time left once the first steps finish. Download the newest bundle after each run, and stop the machine when the queue ends.
+   `STOP_WHEN_DONE=1` stops the machine when the last run finishes; leave it out to keep the machine running. Put the same settings in front of `status` and `bundle`, for example `REWARD_SHOTS=3 STEPS=300 QUEUE_SET=subtb bash scripts/a100_phase1.sh status`.
+6. **Watch and finish.** `status` prints the time left once the first steps finish. Download the newest bundle after each run. With `STOP_WHEN_DONE=1` the machine stops itself at the end; start it again to download the last bundle, then delete it.
 
 Whatever the pilot's fix rates, the full run is the real test: four times the steps, and the paper's reward-temperature horizon. The pilot only sets `REWARD_SHOTS` and `STEPS`.
 
