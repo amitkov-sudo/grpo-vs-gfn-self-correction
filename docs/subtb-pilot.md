@@ -59,6 +59,12 @@ Each step scores the right answer after every stopping point, so a step takes lo
 - Answer length over training. RapTB (Wang et al., ICML 2026) reports length drift when sub-trajectory balance fine-tunes language models.
 - Step time, and any run that stopped early.
 
+## The full run on AWS or the A100
+
+`QUEUE_SET=subtb bash scripts/a100_phase1.sh start` runs the longer version on one GPU: sub-trajectory balance with "Wait" answers, GRPO with "Wait" answers (T4) at the same length, then sub-trajectory balance on own answers. Each run takes 300 steps of 8 problems, with seed 0, evaluations every 50 steps and the paper's reward-temperature horizon of 150 steps. The runbook's section "The full sub-trajectory balance run" has the time and cost estimates. In short: about $40 to $55 on an L4 or an L40S, so $100 of AWS credit covers it, and $200 also covers a second seed. The runbook's "On AWS" section has the setup for EC2 and for SageMaker AI.
+
+Before starting it, check the pilot's reward check and step time. If the reward cannot tell right from wrong answers, the full run would waste the credit.
+
 ## Limits
 
 This pilot is smaller than the paper on every axis: steps, answers per step, no replay buffer, no worked examples in the reward. It has one seed. It can show whether the method learns and which way it moves, not how well it does at the paper's scale.

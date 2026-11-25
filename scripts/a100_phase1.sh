@@ -7,20 +7,24 @@
 #   bash scripts/a100_phase1.sh bundle adapters  the same, plus the LoRA adapters (about 140 MB per run)
 #   bash scripts/a100_phase1.sh stop             stop the queue and the run in progress
 #
-# Three queues, chosen with QUEUE_SET:
+# Four queues, chosen with QUEUE_SET:
 #   phase1 (default)  T5 and T4 first, the main comparison, then T3 and T2. Every evaluation adds 8 sampled answers
 #                     per start (pass@8, majority vote); step 0 and the last step add the error at step 2, 3 and 4.
 #   poison            the poisoning test: GRPO (T2) and trajectory balance on own attempts, with the reward flipped
 #                     on 25% and then 10% of wrong starts. Unpoisoned references are T2 and T3 in phase1.
 #   attack            the attacker-replies test: trajectory balance and GRPO, with 4 of the 8 answers on 25% and then
 #                     5% of wrong starts written after " That step is correct." and rewarded for a wrong answer.
-# Each queue runs seed 0 and then seed 1. A finished run (outputs/<run>/adapter exists) is skipped, so `start` after
-# a stop picks up where the queue left off; an unfinished run starts again from step 0. After every run the script
-# packs a new bundle.
+#   subtb             the full sub-trajectory balance run (docs/subtb-pilot.md): SubTB with "Wait" answers, GRPO with
+#                     "Wait" answers (T4) at the same length, then SubTB on own answers. Defaults: 300 steps,
+#                     8 problems per step, evaluations every 50 steps, seed 0, reward temperature over 150 steps.
+# Phase 1, poison and attack run seed 0 and then seed 1. A finished run (outputs/<run>/adapter exists) is skipped,
+# so `start` after a stop picks up where the queue left off; an unfinished run starts again from step 0. After
+# every run the script packs a new bundle.
 #
 # Settings through environment variables, with their defaults:
 #   QUEUE_SET=phase1  SEEDS="0 1"  MODEL=Qwen/Qwen3-1.7B  STEPS=60  EVAL_EVERY=20  EVAL_SAMPLES=8  LOCATION_N=50
-#   GEN_BATCH=64  MICRO_BATCH=4  PYTHON=python3
+#   GEN_BATCH=64  MICRO_BATCH=4  PROMPTS=16  PYTHON=python3
+#   (subtb: SEEDS="0"  STEPS=300  EVAL_EVERY=50  PROMPTS=8)
 #   TOKENIZER=   only for an offline check whose cached tokenizer lacks a chat template
 #   SMOKE=1      the whole queue with the tiny random model on the CPU, two steps per run: a code check
 set -euo pipefail
@@ -28,10 +32,11 @@ SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$SCRIPT")/.."
 
 PY=${PYTHON:-$(command -v python3 || command -v python)}
-SEEDS=${SEEDS:-"0 1"}
+SEEDS=${SEEDS:-}
 MODEL=${MODEL:-Qwen/Qwen3-1.7B}
-STEPS=${STEPS:-60}
-EVAL_EVERY=${EVAL_EVERY:-20}
+STEPS=${STEPS:-}
+EVAL_EVERY=${EVAL_EVERY:-}
+PROMPTS=${PROMPTS:-}
 EVAL_SAMPLES=${EVAL_SAMPLES:-8}
 LOCATION_N=${LOCATION_N:-50}
 GEN_BATCH=${GEN_BATCH:-64}
@@ -52,13 +57,21 @@ case "$QUEUE_SET" in
         QUEUE=("TB-a25:--method tb --attack 0.25" "T2-a25:--method grpo --attack 0.25"
                "TB-a5:--method tb --attack 0.05" "T2-a5:--method grpo --attack 0.05")
         EXTRA=() ;;
+    subtb)
+        QUEUE=("SubTB-wait:--method subtb --nudge 0.5 --warmup-steps 20 --reward-temp-horizon 150"
+               "T4:--method grpo --nudge 0.5"
+               "SubTB-own:--method subtb --warmup-steps 20 --reward-temp-horizon 150")
+        EXTRA=(--location-n "$LOCATION_N")
+        SEEDS=${SEEDS:-0}; STEPS=${STEPS:-300}; EVAL_EVERY=${EVAL_EVERY:-50}; PROMPTS=${PROMPTS:-8} ;;
     *)
-        echo "QUEUE_SET must be phase1, poison or attack"; exit 1 ;;
+        echo "QUEUE_SET must be phase1, poison, attack or subtb"; exit 1 ;;
 esac
+SEEDS=${SEEDS:-"0 1"}; STEPS=${STEPS:-60}; EVAL_EVERY=${EVAL_EVERY:-20}
+if [ -n "$PROMPTS" ]; then EXTRA+=(--prompts "$PROMPTS"); fi
 if [ -n "$SMOKE" ]; then
     PREFIX="smoke-${QUEUE_SET}-"
     COMMON=(--task fix --smoke --eval-samples 2)
-    if [ "$QUEUE_SET" = phase1 ]; then COMMON+=(--location-n 2); fi
+    if [ "$QUEUE_SET" = phase1 ] || [ "$QUEUE_SET" = subtb ]; then COMMON+=(--location-n 2); fi
     STEPS=2; EVAL_EVERY=2
 else
     PREFIX="${QUEUE_SET}-"

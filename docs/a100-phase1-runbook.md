@@ -89,6 +89,28 @@ The unpoisoned references are `phase1-T2` and `phase1-T3`; T3 makes the same upd
 
 `QUEUE_SET=attack bash scripts/a100_phase1.sh start` runs the attacker-replies test (`docs/attacker-replies-test.md`). On attacked wrong-step problems, 4 of the 8 answers continue after " That step is correct." and earn 1 for a wrong final answer. The queue runs trajectory balance and GRPO at 25% and then 5% of wrong-step problems, with seeds 0 and 1. Run names start with `attack-`. The references come from Phase 1, and the summary adds a table of how often the model approves a step on its own.
 
+## The full sub-trajectory balance run
+
+`QUEUE_SET=subtb bash scripts/a100_phase1.sh start` runs the full version of the pilot in `docs/subtb-pilot.md`, one run after another on one GPU:
+
+| Order | Run | Condition |
+|---|---|---|
+| 1 | `subtb-SubTB-wait-s0` | sub-trajectory balance with "Wait" answers |
+| 2 | `subtb-T4-s0` | GRPO with "Wait" answers at the same length, the comparison |
+| 3 | `subtb-SubTB-own-s0` | sub-trajectory balance on the model's own answers |
+
+Each run takes 300 steps of 8 problems, with seed 0. It evaluates every 50 steps with 8 sampled answers per problem, and runs the location test with 50 problems at the start and the end. The reward temperature moves from 1.1 to 0.5 over 150 steps, the paper's horizon. `STEPS`, `PROMPTS` and `SEEDS` change the size; for example, `SEEDS="0 1"` adds a second seed. `status` and `bundle` need the same `QUEUE_SET=subtb` in front.
+
+**Time and cost.** Nobody has timed these runs on an L4 or an L40S yet. These estimates start from the Kaggle T4, which took 4.3 minutes per GRPO step (measured) and should take about 6 minutes per sub-trajectory balance step (estimated). They assume an L4 runs about twice as fast as a T4 and an L40S about four times as fast. Evaluations add about 6 hours on an L4.
+
+| Machine | Price | Time for the queue | Cost |
+|---|---|---|---|
+| EC2 g6.xlarge, L4 | $0.80/h | about 47 h | about $38 |
+| SageMaker AI ml.g6.xlarge, L4 | about $1.10/h | about 47 h | about $52 |
+| EC2 g6e.xlarge, L40S | $1.86/h | about 24 h | about $44 |
+
+Allow 50% either way for the estimate. $100 of credit covers the queue with room to spare, and $200 also covers a second seed. `status` prints the real time left once the first steps finish, and the budget alerts catch a machine left running.
+
 ## When something goes wrong
 
 - **Out of GPU memory,** for example because another team shares the card: the trainer halves its batch, logs a line and carries on.
@@ -252,7 +274,7 @@ cd grpo-vs-gfn-self-correction
 bash scripts/a100_phase1.sh start
 ```
 
-The first line switches to the image's PyTorch environment, so run it again after every login. The queue keeps running after you close the terminal. The commands in [The poisoning queue](#the-poisoning-queue), [The attacker queue](#the-attacker-queue) and [When something goes wrong](#when-something-goes-wrong) work here unchanged.
+The first line switches to the image's PyTorch environment, so run it again after every login. The queue keeps running after you close the terminal. For the full sub-trajectory balance run, start it with `QUEUE_SET=subtb bash scripts/a100_phase1.sh start` instead. The commands in [The poisoning queue](#the-poisoning-queue), [The attacker queue](#the-attacker-queue) and [When something goes wrong](#when-something-goes-wrong) work here unchanged.
 
 ### 5. Download the results
 
@@ -266,6 +288,29 @@ scp -i ~/Downloads/<key>.pem "ubuntu@<public IPv4 address>:grpo-vs-gfn-self-corr
 
 - **Stop** the instance (Instance state, then Stop instance) whenever no queue runs. A stopped machine costs only its disk, and it gets a new address when it starts again.
 - **Terminate** it once the bundles are on your Mac. That deletes the machine and its disk and ends all charges.
+
+### SageMaker AI instead of EC2
+
+The program's AWS guide uses SageMaker AI notebook instances. They cost about a third more than EC2 but come with JupyterLab and a file browser, and the program's GPU guide walks through the console.
+
+1. **Quota.** In Service Quotas, choose Amazon SageMaker and request 1 on the notebook instance quota for your machine type, for example "ml.g6.xlarge for notebook instance usage". The program's guide shows where.
+2. **Notebook instance.** In SageMaker AI (not the older "Amazon SageMaker", as the guide warns), create a notebook instance of type ml.g6.xlarge (L4) or ml.g6e.xlarge (L40S). If neither type appears, ml.g5.xlarge (A10G, 24 GB) also fits. Set the volume size to 50 GB; the default is too small for the model.
+3. **Start the queue.** Open JupyterLab, then a terminal:
+
+```bash
+cd ~/SageMaker
+conda env list
+source activate pytorch_p310
+export HF_HOME=~/SageMaker/hf-cache
+git clone https://github.com/amitkov-sudo/grpo-vs-gfn-self-correction.git
+cd grpo-vs-gfn-self-correction
+QUEUE_SET=subtb bash scripts/a100_phase1.sh start
+```
+
+The second line lists the Python environments. If the PyTorch one has another name, use that name on the third line. `HF_HOME` keeps the downloaded model on the 50 GB volume. After a new login, run the `source activate` line again before `status`.
+
+4. **Download** the bundles from the JupyterLab file browser: right-click a file in `bundles/`, then Download.
+5. **Stop** the notebook instance in the SageMaker AI console when the queue has finished, and delete it once the bundles are on your Mac. Closing the browser does not stop the billing.
 
 ### When something goes wrong on AWS
 
